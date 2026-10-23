@@ -166,10 +166,12 @@ std::uint32_t DragValue(const MouseRead& mouse, bool preview) {
 }
 
 void AddKeyboardAndMouse(PadState& pad, const bool* keys, int nkeys, const MouseRead& mouse, bool menu,
-                         bool keys_move_hunter, bool camera) {
+                         bool camera, bool keys_move_hunter, bool& keyboard_move_x, bool& keyboard_move_y) {
     const auto& s = BbSettings::Get();
     bool held[kBindCount] = {};
     if (keys) host_bindings_keys_held(keys, nkeys, held);
+    keyboard_move_x = held[kBindMoveL] || held[kBindMoveR];
+    keyboard_move_y = held[kBindMoveF] || held[kBindMoveB];
     if (g_device.load(std::memory_order_relaxed) == InputDevice::KeyboardMouse) {
 
         for (std::uint8_t* stick : {&pad.lx, &pad.ly, &pad.rx, &pad.ry}) {
@@ -177,18 +179,22 @@ void AddKeyboardAndMouse(PadState& pad, const bool* keys, int nkeys, const Mouse
         }
     }
     const std::uint64_t now = SDL_GetTicks();
-    const bool navigating = menu && !keys_move_hunter && MenuPointer::Navigating() && now >= g_settle_until;
-    const std::uint32_t dpad = DpadFromKeys(keys, held, keys_move_hunter);
+    // Separate immutable menu navigation from gameplay keys (only while a menu has the screen:
+    // menu_pointer_navigating). The arrows navigate; the movement keys stay movement (left stick).
+    const bool navigating = menu && MenuPointer::Navigating() && now >= g_settle_until;
+    const std::uint32_t dpad = DpadFromKeys(keys);
     g_dpad_blocked &= dpad;
     if (keys && !menu) WatchSprint(held);
-    if ((navigating || keys_move_hunter) && keys) {
+    if (navigating && keys) {
+        // The look keys stay out of a menu the arrows navigate, unless they are the character's
+        // (Move and look in menus).
+        if (!keys_move_hunter)
+            for (int a = kBindLookU; a <= kBindLookR; ++a) held[a] = false;
+        // bbport: a direction held when a menu or prompt is confirmed or closed is no d-pad until
+        // it is let go of: the menu state lags the closing by a few frames.
         pad.buttons |= dpad & ~g_dpad_blocked;
         if (keys[SDL_SCANCODE_RETURN]) pad.buttons |= menu_confirm_button();
         if (keys[SDL_SCANCODE_BACKSPACE]) pad.buttons |= menu_back_button();
-        if (!keys_move_hunter) {
-            for (int a = kBindMoveF; a <= kBindMoveR; ++a) held[a] = false;
-            for (int a = kBindLookU; a <= kBindLookR; ++a) held[a] = false;
-        }
     }
     host_bindings_apply(held, held[kBindStrongMod], pad);
 
@@ -212,7 +218,7 @@ void AddKeyboardAndMouse(PadState& pad, const bool* keys, int nkeys, const Mouse
             else if (mouse.pressed & kRightButton) pad.buttons |= menu_back_button();
             if (preview && mouse.wheel != 0) {
                 pad.buttons |= mouse.wheel > 0 ? kR1 : kL1;
-            } else if (navigating || keys_move_hunter) {
+            } else if (navigating) {
                 if (mouse.wheel > 0) pad.buttons |= kUp;
                 if (mouse.wheel < 0) pad.buttons |= kDown;
             }
@@ -461,16 +467,25 @@ extern "C" int bbgpu_pc_input(BbPcPad* d, const bool* keys, int nkeys, int gamep
     bool any_down = mouse.held != 0;
     for (int i = 0; keys && i < nkeys && !any_down; ++i) any_down = keys[i];
     host_bind_capture_note_held(any_down);
+    bool keyboard_move_x = false, keyboard_move_y = false;
     if (!g_focused || g_text_entry || host_bind_capture_blocking()) {
 
         pad = PadState{};
         g_wants_relative = false;
     } else {
-        AddKeyboardAndMouse(pad, keys, nkeys, mouse, menu, keys_move_hunter, camera);
+        AddKeyboardAndMouse(pad, keys, nkeys, mouse, menu, camera, keys_move_hunter, keyboard_move_x,
+                            keyboard_move_y);
+    }
+    // bbport: a menu owns the screen, so the movement keys must not tilt the stick the pointer
+    // follows: a held W would otherwise block the mouse (menu_pointer.cpp: DirectionHeld).
+    PadState published = pad;
+    if (menu) {
+        if (keyboard_move_x) published.lx = kStickRest;
+        if (keyboard_move_y) published.ly = kStickRest;
     }
     {
         std::scoped_lock lock(g_pad_lock);
-        g_last_pad = pad;
+        g_last_pad = published;
     }
     d->buttons = pad.buttons;
     d->lx = pad.lx;
