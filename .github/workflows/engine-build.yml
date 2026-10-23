@@ -1,0 +1,375 @@
+name: Build Windows package
+
+# Builds this repository's engine, packages it over the pinned Lantern Engine 0.9.37 base, and
+# publishes one NightwatchCoop ZIP as a GitHub pre-release when a v* tag is pushed.
+on:
+  push:
+    tags:
+      - "v*"
+
+concurrency:
+  group: engine-build-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 240
+
+    steps:
+      - name: Use LF line endings
+        shell: pwsh
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.eol lf
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Resolve version
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:GITHUB_REF_TYPE -ne 'tag') {
+              throw "Release builds must be triggered by a tag (got '$($env:GITHUB_REF_TYPE)')."
+          }
+
+          $tag = $env:GITHUB_REF_NAME.Trim()
+          if ($tag -notmatch '^v\d+\.\d+\.\d+(?:-beta\.\d+(?:\.\d+)?)?$') {
+              throw "Invalid release tag '$tag' (expected e.g. v0.2.0-beta.1)."
+          }
+          $version = $tag.Substring(1)
+
+          $utf8 = New-Object System.Text.UTF8Encoding($false)
+          [IO.File]::AppendAllText($env:GITHUB_ENV, "TAG=$tag`nVERSION=$version`n", $utf8)
+          Write-Host "Release tag: $tag"
+          Write-Host "Package version: $version"
+
+      - name: Setup MSYS2 CLANG64
+        id: msys2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: CLANG64
+          update: true
+          install: >-
+            git
+            curl
+            mingw-w64-clang-x86_64-clang
+            mingw-w64-clang-x86_64-lld
+            mingw-w64-clang-x86_64-llvm
+            mingw-w64-clang-x86_64-binutils
+            mingw-w64-clang-x86_64-libc++
+            mingw-w64-clang-x86_64-cmake
+            mingw-w64-clang-x86_64-ninja
+            mingw-w64-clang-x86_64-pkgconf
+            mingw-w64-clang-x86_64-python
+            mingw-w64-clang-x86_64-sdl3
+            mingw-w64-clang-x86_64-boost
+            mingw-w64-clang-x86_64-nlohmann-json
+            mingw-w64-clang-x86_64-openssl
+            mingw-w64-clang-x86_64-protobuf
+            mingw-w64-clang-x86_64-miniupnpc
+            mingw-w64-clang-x86_64-fmt
+            mingw-w64-clang-x86_64-glslang
+            mingw-w64-clang-x86_64-spirv-cross
+            mingw-w64-clang-x86_64-spirv-headers
+            mingw-w64-clang-x86_64-vulkan-headers
+            mingw-w64-clang-x86_64-vulkan-loader
+            mingw-w64-clang-x86_64-vulkan-memory-allocator
+            mingw-w64-clang-x86_64-xxhash
+            mingw-w64-clang-x86_64-zydis
+            mingw-w64-clang-x86_64-robin-map
+            mingw-w64-clang-x86_64-ffmpeg
+            mingw-w64-clang-x86_64-zlib
+            mingw-w64-clang-x86_64-expat
+
+      - name: Build engine
+        shell: msys2 {0}
+        working-directory: engine
+        env:
+          CC: clang
+          CXX: clang++
+          BB_JOBS: 4
+        run: |
+          set -euo pipefail
+          bash build.sh
+          test -f out/bb-probe.exe
+          test -f out/bb-start.exe
+          test -f out/bb-shader-lab.exe
+          test -f out/bb-engine-assets.exe
+          test -f out/bb-gpu-capabilities.exe
+          test -f out/gpu-cache.id
+
+      - name: Run Steam identity test
+        shell: msys2 {0}
+        working-directory: engine
+        run: |
+          set -euo pipefail
+          ninja -C out/gpu party-steam-identity-test
+          ctest --test-dir out/gpu -R '^party-steam-identity-test$' --output-on-failure
+
+      - name: Setup .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Run launcher tests
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          dotnet run --project "launcher/windows/SeamlessTests/SeamlessTests.csproj" -c Release
+          if ($LASTEXITCODE -ne 0) { throw 'Launcher tests failed.' }
+          $ui = Join-Path $env:RUNNER_TEMP 'nightwatch-ui'
+          dotnet run --project "launcher/windows/SeamlessTests/SeamlessTests.csproj" -c Release --no-build -- --render-ui $ui
+          if ($LASTEXITCODE -ne 0) { throw 'Launcher UI render test failed.' }
+
+      - name: Fetch pinned Lantern Engine base
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $baseTag = 'v0.9.37'
+          $baseVersion = '0.9.37'
+          $assetName = 'LanternEngine-v0.9.37-win64.zip'
+          $headers = @{
+              'User-Agent' = 'NightwatchCoop-build'
+              'Accept' = 'application/vnd.github+json'
+              'Authorization' = "Bearer $env:GH_TOKEN"
+          }
+
+          $release = Invoke-RestMethod -Headers $headers `
+              -Uri "https://api.github.com/repos/Awakenchan/LanternEngine/releases/tags/$baseTag"
+          if ($release.draft) { throw "Lantern Engine $baseTag is a draft release." }
+          $asset = $release.assets | Where-Object { $_.name -eq $assetName } | Select-Object -First 1
+          if (-not $asset) { throw "Lantern Engine $baseTag has no $assetName asset." }
+
+          $zip = Join-Path $env:RUNNER_TEMP 'lantern-base.zip'
+          $extract = Join-Path $env:RUNNER_TEMP 'lantern-base'
+          foreach ($path in @($zip, $extract)) {
+              if (Test-Path -LiteralPath $path) {
+                  Remove-Item -LiteralPath $path -Recurse -Force -Confirm:$false
+              }
+          }
+          curl.exe -fsSL --retry 3 --retry-delay 2 -o $zip $asset.browser_download_url
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to download the Lantern Engine base package.' }
+          New-Item -ItemType Directory -Force -Path $extract | Out-Null
+          & tar.exe -xf $zip -C $extract
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to extract the Lantern Engine base package.' }
+
+          $bbport = Get-ChildItem -LiteralPath $extract -Recurse -Filter 'bbport.ini' -File |
+              Select-Object -First 1
+          if (-not $bbport) { throw 'bbport.ini was not found in the Lantern Engine base package.' }
+          $base = $bbport.Directory.FullName
+          $manifest = Get-Content -LiteralPath (Join-Path $base 'package.json') -Raw | ConvertFrom-Json
+          $actual = ([string]$manifest.version).TrimStart('v', 'V')
+          if ($actual -ne $baseVersion) {
+              throw "Lantern Engine base version '$actual' does not match '$baseVersion'."
+          }
+          if (-not (Test-Path -LiteralPath (Join-Path $base 'engine/out/bb-start.exe'))) {
+              throw 'The Lantern Engine base has no engine/out/bb-start.exe.'
+          }
+
+          $utf8 = New-Object System.Text.UTF8Encoding($false)
+          [IO.File]::AppendAllText($env:GITHUB_ENV, "LANTERN_BASE=$base`n", $utf8)
+          Write-Host "Lantern Engine base: $baseTag at $base"
+
+      - name: Assemble package
+        shell: pwsh
+        env:
+          MSYS2_LOCATION: ${{ steps.msys2.outputs.msys2-location }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $package = Join-Path $env:GITHUB_WORKSPACE 'work/package/NightwatchCoop'
+          if (Test-Path -LiteralPath $package) {
+              Remove-Item -LiteralPath $package -Recurse -Force -Confirm:$false
+          }
+          & (Join-Path $env:GITHUB_WORKSPACE 'tools/package-seamless.ps1') `
+              -Base $env:LANTERN_BASE `
+              -Version $env:VERSION `
+              -Release `
+              -MsysRoot $env:MSYS2_LOCATION
+          if (-not (Test-Path -LiteralPath (Join-Path $package 'package.json'))) {
+              throw 'The package was not assembled.'
+          }
+
+      - name: Verify package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $stage = Join-Path $env:GITHUB_WORKSPACE 'work/package/NightwatchCoop'
+          $required = @(
+              'Nightwatch Co-op.exe',
+              'Bloodborne.exe',
+              'README.md',
+              'package.json',
+              'steam_api64.dll',
+              'engine/steam_appid.txt',
+              'engine/out/bb-probe.exe',
+              'engine/out/bb-start.exe',
+              'engine/out/bb-shader-lab.exe',
+              'engine/out/bb-engine-assets.exe',
+              'engine/out/bb-gpu-capabilities.exe',
+              'engine/out/gpu-cache.id',
+              'engine/out/SDL3.dll',
+              'engine/out/libc++.dll',
+              'engine/out/nvngx_dlss.dll',
+              'engine/out/steam_api64.dll',
+              'engine/out/bloodborne.ico',
+              'engine/patches/Bloodborne.xml',
+              'engine/data/image_109_hashes.txt',
+              'engine/fsr4_shaders/rcas.spv',
+              'engine/fsr4vk/amd_fidelityfx_upscaler_vk.dll',
+              'engine/gamecontrollerdb.txt',
+              'seamless/python/python.exe',
+              'seamless/scripts/party_save_tool.py'
+          )
+          $missing = @($required | Where-Object {
+              -not (Test-Path -LiteralPath (Join-Path $stage $_))
+          })
+          if ($missing.Count) { throw "Package is missing: $($missing -join ', ')" }
+
+          $manifest = Get-Content -LiteralPath (Join-Path $stage 'package.json') -Raw | ConvertFrom-Json
+          if ($manifest.version -ne $env:VERSION) {
+              throw "Package version '$($manifest.version)' does not match '$env:VERSION'."
+          }
+          $engineId = "nightwatch-coop-$env:VERSION"
+          if ($manifest.engine -ne $engineId) {
+              throw "Package engine '$($manifest.engine)' does not match '$engineId'."
+          }
+          if ((Get-Content -LiteralPath (Join-Path $stage 'engine/steam_appid.txt') -Raw).Trim() -ne '480') {
+              throw 'The default engine/steam_appid.txt is not 480.'
+          }
+          if (Test-Path -LiteralPath (Join-Path $stage 'seamless-defaults.json')) {
+              throw 'A release package must not contain seamless-defaults.json.'
+          }
+          if (-not (Get-ChildItem -LiteralPath (Join-Path $stage 'engine/shader-catalog') `
+                  -Recurse -Filter 'profile.bin' -File | Select-Object -First 1)) {
+              throw 'The package is missing the shader catalog profile.bin.'
+          }
+          foreach ($folder in @('user', 'logs', 'mods', 'network', 'engine-assets')) {
+              if (Test-Path -LiteralPath (Join-Path $stage $folder)) {
+                  throw "A release package must not contain $folder."
+              }
+          }
+          Write-Host ("Package verified: {0:N0} files" -f
+              (Get-ChildItem -LiteralPath $stage -Recurse -File).Count)
+
+      - name: Create release zip
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $stage = Join-Path $env:GITHUB_WORKSPACE 'work/package/NightwatchCoop'
+          $dist = Join-Path $env:GITHUB_WORKSPACE 'dist'
+          New-Item -ItemType Directory -Force -Path $dist | Out-Null
+          Get-ChildItem -LiteralPath $dist -Filter 'NightwatchCoop-*-win64.zip' -File |
+              Remove-Item -Force -Confirm:$false
+
+          $zip = Join-Path $dist "NightwatchCoop-$env:TAG-win64.zip"
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          [IO.Compression.ZipFile]::CreateFromDirectory(
+              $stage, $zip, [IO.Compression.CompressionLevel]::Optimal, $true)
+
+          $required = @(
+              'NightwatchCoop/Nightwatch Co-op.exe',
+              'NightwatchCoop/Bloodborne.exe',
+              'NightwatchCoop/package.json',
+              'NightwatchCoop/steam_api64.dll',
+              'NightwatchCoop/engine/out/bb-probe.exe',
+              'NightwatchCoop/engine/out/bb-start.exe',
+              'NightwatchCoop/engine/out/bb-shader-lab.exe',
+              'NightwatchCoop/engine/out/steam_api64.dll'
+          )
+          $archive = [IO.Compression.ZipFile]::OpenRead($zip)
+          try {
+              $names = @($archive.Entries | ForEach-Object { $_.FullName.Replace('\', '/') })
+              $missing = @($required | Where-Object { $names -notcontains $_ })
+              if ($missing.Count) { throw "Zip is missing: $($missing -join ', ')" }
+              if (-not ($names | Where-Object {
+                      $_ -like 'NightwatchCoop/engine/shader-catalog/*/profile.bin'
+                  } | Select-Object -First 1)) {
+                  throw 'Zip is missing the shader catalog profile.bin.'
+              }
+              $bad = @($names | Where-Object {
+                  $_ -match '(?i)^NightwatchCoop/(user|logs|mods|network|engine-assets)/' -or
+                  $_ -match '(?i)^NightwatchCoop/seamless-defaults\.json$' -or
+                  $_ -match '(?i)(^|/)__pycache__/' -or
+                  $_ -match '(?i)\.pyc$' -or
+                  $_ -match '(?i)\.(orig|bak|old)$'
+              })
+              if ($bad.Count) {
+                  throw "Refusing to ship $($bad.Count) dev/game files, e.g. $($bad[0])"
+              }
+          } finally {
+              $archive.Dispose()
+          }
+
+          $zips = @(Get-ChildItem -LiteralPath $dist -Filter 'NightwatchCoop-*-win64.zip' -File)
+          if ($zips.Count -ne 1) {
+              throw "Expected exactly one package zip, found $($zips.Count)."
+          }
+          $utf8 = New-Object System.Text.UTF8Encoding($false)
+          [IO.File]::AppendAllText($env:GITHUB_ENV, "ZIP_PATH=$($zips[0].FullName)`n", $utf8)
+          Write-Host ("Zip: {0} ({1:N0} MB)" -f $zips[0].Name, ($zips[0].Length / 1MB))
+
+      - name: Upload package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: NightwatchCoop-${{ github.ref_name }}
+          path: dist/NightwatchCoop-*-win64.zip
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Publish GitHub release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
+          $tag = $env:TAG
+          $zip = Get-Item -LiteralPath $env:ZIP_PATH
+          $title = "Nightwatch Co-op $tag"
+          $notes = @(
+              'Steam P2P: the host starts a party, then invites friends from the Steam overlay in game.'
+              'Guests select Join Game in the Steam friends overlay; the launcher has no friends list and does not ask for a SteamID.'
+              ''
+              'This release is one ZIP. Extract it to a new NightwatchCoop folder.'
+          ) -join "`n"
+
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -eq 0) {
+              Write-Host "Release $tag already exists; replacing the package asset."
+              gh release upload $tag $zip.FullName --clobber
+              if ($LASTEXITCODE -ne 0) { throw "Failed to upload $($zip.Name) to release $tag." }
+              gh release edit $tag --title $title --notes $notes --prerelease
+              if ($LASTEXITCODE -ne 0) { throw "Failed to update release $tag." }
+          } else {
+              Write-Host "Creating release $tag."
+              $releaseArgs = @(
+                  'release', 'create', $tag, $zip.FullName,
+                  '--verify-tag',
+                  '--title', $title,
+                  '--notes', $notes
+              )
+              if ($env:VERSION -match '-') { $releaseArgs += '--prerelease' }
+              & gh @releaseArgs
+              if ($LASTEXITCODE -ne 0) { throw "Failed to create release $tag." }
+          }
+          Write-Host ("Release asset: {0} ({1:N0} MB)" -f $zip.Name, ($zip.Length / 1MB))
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: engine-build-log-${{ github.sha }}
+          path: engine/out/gpu-build.log
+          if-no-files-found: ignore
+          retention-days: 7

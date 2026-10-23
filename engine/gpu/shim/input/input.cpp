@@ -87,14 +87,13 @@ float g_drag_anchor = 0;
 int g_drag_steps = 0;
 bool g_drag_released = true;
 
-std::uint32_t DpadFromKeys(const bool* keys, const bool held[kBindCount], bool keys_move_hunter) {
+std::uint32_t DpadFromKeys(const bool* keys) {
     if (!keys) return 0;
-    const bool movement = !keys_move_hunter;
     std::uint32_t dpad = 0;
-    if (keys[SDL_SCANCODE_UP] || (movement && held[kBindMoveF])) dpad |= kUp;
-    if (keys[SDL_SCANCODE_DOWN] || (movement && held[kBindMoveB])) dpad |= kDown;
-    if (keys[SDL_SCANCODE_LEFT] || (movement && held[kBindMoveL])) dpad |= kLeft;
-    if (keys[SDL_SCANCODE_RIGHT] || (movement && held[kBindMoveR])) dpad |= kRight;
+    if (keys[SDL_SCANCODE_UP]) dpad |= kUp;
+    if (keys[SDL_SCANCODE_DOWN]) dpad |= kDown;
+    if (keys[SDL_SCANCODE_LEFT]) dpad |= kLeft;
+    if (keys[SDL_SCANCODE_RIGHT]) dpad |= kRight;
     return dpad;
 }
 
