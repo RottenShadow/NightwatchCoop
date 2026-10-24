@@ -32,6 +32,15 @@ jobs:
           submodules: recursive
           fetch-depth: 1
 
+      - name: Verify patch line endings
+        shell: pwsh
+        run: |
+          $bad = @(git ls-files --eol -- '*.patch' | Where-Object { $_ -match '^i/.*crlf' })
+          if ($bad.Count) {
+              $bad | ForEach-Object { Write-Host $_ }
+              throw 'Patch files must use LF line endings.'
+          }
+
       - name: Resolve version
         shell: pwsh
         run: |

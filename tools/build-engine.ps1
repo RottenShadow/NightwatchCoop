@@ -19,9 +19,9 @@ try {
     if ($LASTEXITCODE) { throw 'Submodule initialization failed' }
     $fsr = Join-Path $engine 'gpu\third_party\fsr-vulkan'
     foreach ($patch in Get-ChildItem -LiteralPath (Join-Path $engine 'gpu\patches\fsr-vulkan') -Filter '*.patch') {
-        git -C $fsr apply --reverse --check $patch.FullName 2>$null
+        git -C $fsr apply --reverse --check --ignore-whitespace $patch.FullName 2>$null
         if ($LASTEXITCODE) {
-            git -C $fsr apply $patch.FullName
+            git -C $fsr apply --ignore-whitespace $patch.FullName
             if ($LASTEXITCODE) { throw "FSR patch failed: $($patch.Name)" }
         }
     }

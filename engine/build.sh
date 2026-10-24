@@ -71,8 +71,8 @@ fi
 # A plain source copy (no submodule checkout) already has them applied.
 if [[ -e gpu/third_party/fsr-vulkan/.git ]]; then
     for patch in gpu/patches/fsr-vulkan/*.patch; do
-        if ! git -C gpu/third_party/fsr-vulkan apply --reverse --check "$PWD/$patch" 2>/dev/null; then
-            git -C gpu/third_party/fsr-vulkan apply "$PWD/$patch"
+        if ! git -C gpu/third_party/fsr-vulkan apply --reverse --check --ignore-whitespace "$PWD/$patch" 2>/dev/null; then
+            git -C gpu/third_party/fsr-vulkan apply --ignore-whitespace "$PWD/$patch"
         fi
     done
 fi

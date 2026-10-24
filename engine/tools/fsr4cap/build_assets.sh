@@ -104,7 +104,7 @@ else
         git clone -q https://github.com/HansKristian-Work/dxil-spirv.git "$dx"
         git -C "$dx" checkout -q 7dc52786cdb1f53c54dd5c5c2698dff00ea5f0a3
         git -C "$dx" submodule update -q --init --recursive
-        git -C "$dx" apply "$here/dxil-spirv-class-bindings.patch"
+        git -C "$dx" apply --ignore-whitespace "$here/dxil-spirv-class-bindings.patch"
         cmake -S "$dx" -B "$dx/build" -G Ninja -DCMAKE_BUILD_TYPE=Release >/dev/null
         ninja -C "$dx/build" dxil-spirv >/dev/null
     fi
