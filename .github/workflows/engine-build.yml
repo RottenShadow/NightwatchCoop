@@ -172,11 +172,18 @@ jobs:
           & tar.exe -xf $zip -C $extract
           if ($LASTEXITCODE -ne 0) { throw 'Failed to extract the Lantern Engine base package.' }
 
-          $bbport = Get-ChildItem -LiteralPath $extract -Recurse -Filter 'bbport.ini' -File |
+          $manifestFile = Get-ChildItem -LiteralPath $extract -Recurse -Filter 'package.json' -File |
+              Where-Object { Test-Path -LiteralPath (Join-Path $_.DirectoryName 'engine/out/bb-start.exe') } |
               Select-Object -First 1
-          if (-not $bbport) { throw 'bbport.ini was not found in the Lantern Engine base package.' }
-          $base = $bbport.Directory.FullName
-          $manifest = Get-Content -LiteralPath (Join-Path $base 'package.json') -Raw | ConvertFrom-Json
+          if (-not $manifestFile) {
+              throw 'package.json with engine/out/bb-start.exe was not found in the Lantern Engine base package.'
+          }
+          $base = $manifestFile.DirectoryName
+          if (-not (Test-Path -LiteralPath (Join-Path $base 'engine/lantern.default.ini')) -and
+              -not (Test-Path -LiteralPath (Join-Path $base 'bbport.ini'))) {
+              throw 'The Lantern Engine base has neither engine/lantern.default.ini nor bbport.ini.'
+          }
+          $manifest = Get-Content -LiteralPath $manifestFile.FullName -Raw | ConvertFrom-Json
           $actual = ([string]$manifest.version).TrimStart('v', 'V')
           if ($actual -ne $baseVersion) {
               throw "Lantern Engine base version '$actual' does not match '$baseVersion'."
