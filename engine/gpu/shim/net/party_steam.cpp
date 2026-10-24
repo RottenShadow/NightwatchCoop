@@ -379,24 +379,15 @@ void on_status(SteamNetConnectionStatusChangedCallback_t* p) {
     }
 
     if (state == k_ESteamNetworkingConnectionState_Connecting) {
-        bool vouched = false;
-        {
-            std::lock_guard<std::mutex> lock(s->mu);
-            vouched = s->trusted.find(id) != s->trusted.end();
-        }
-        // Hosts accept Steam friends; a guest may also connect to another guest the host named
-        // over the authenticated party link (the players need not be Steam friends themselves).
-        if (!vouched && !friend_of(s->flat, s->friends, id)) {
-            bbnet::log("Steam P2P: refusing %llu: not a Steam friend and not vouched",
-                       static_cast<unsigned long long>(id));
-            s->flat.close_connection(sockets, p->m_hConn, k_ESteamNetConnectionEnd_App_Generic, "not a friend",
-                                     false);
-            return;
-        }
+        // Accept any incoming Steam P2P connection at the network level.
+        // Admission is enforced by PartyLink's AUTH handshake and the party password
+        // (BB_PARTY_PASSWORD); no Steam friendship is required.
         if (!incoming) {
             bbnet::log("Steam P2P: %llu is opening the connection", static_cast<unsigned long long>(id));
             return;
         }
+        // Incoming connection on the listen socket: accept unconditionally at the Steam layer.
+        // PartyLink's HELLO/AUTH handshake (password + party code) enforces authentication.
         {
             std::lock_guard<std::mutex> lock(s->mu);
             const auto it = s->conn_by_peer.find(id);
