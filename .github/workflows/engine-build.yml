@@ -115,13 +115,13 @@ jobs:
           test -f out/bb-gpu-capabilities.exe
           test -f out/gpu-cache.id
 
-      - name: Run Steam identity test
+      - name: Run Steam tests
         shell: msys2 {0}
         working-directory: engine
         run: |
           set -euo pipefail
-          ninja -C out/gpu party-steam-identity-test
-          ctest --test-dir out/gpu -R '^party-steam-identity-test$' --output-on-failure
+          ninja -C out/gpu party-steam-identity-test party-steam-retry-test
+          ctest --test-dir out/gpu -R '^party-steam-(identity|retry)-test$' --output-on-failure
 
       - name: Setup .NET 8
         uses: actions/setup-dotnet@v4
@@ -398,6 +398,7 @@ jobs:
           $notes = @(
               'Steam P2P: the host starts a party, then invites friends from the Steam overlay in game.'
               'Guests select Join Game in the Steam friends overlay; the launcher has no friends list and does not ask for a SteamID.'
+              'A guest keeps retrying a host that is still starting (2 s, backing off to 30 s) instead of staying stuck on Connecting.'
               ''
               'This release is one ZIP. Extract it to a new NightwatchCoop folder.'
           ) -join "`n"

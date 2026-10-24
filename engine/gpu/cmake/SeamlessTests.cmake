@@ -456,6 +456,12 @@ target_compile_definitions(party-steam-identity-test PRIVATE BB_STEAM_STUB=1)
 target_compile_options(party-steam-identity-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
 target_include_directories(party-steam-identity-test PRIVATE shim shim/net)
 set_target_properties(party-steam-identity-test PROPERTIES INTERPROCEDURAL_OPTIMIZATION OFF)
+# Guest ConnectP2P retry policy (header only): backoff, cap, due peers, clear. ninja -C out/gpu
+# party-steam-retry-test
+add_executable(party-steam-retry-test EXCLUDE_FROM_ALL ../tests/test_party_steam_retry.cpp)
+target_compile_options(party-steam-retry-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+target_include_directories(party-steam-retry-test PRIVATE shim shim/net)
+set_target_properties(party-steam-retry-test PROPERTIES INTERPROCEDURAL_OPTIMIZATION OFF)
 get_property(all_targets DIRECTORY PROPERTY BUILDSYSTEM_TARGETS)
 set(party_tests)
 foreach(target IN LISTS all_targets)

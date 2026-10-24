@@ -73,6 +73,9 @@ public:
     bool is_connected(std::uint64_t steamid) const;
     // Drop one peer (a member that left) without touching the other sessions.
     bool disconnect_peer(std::uint64_t steamid);
+    // Stop retrying a peer but keep its Steam handle (PartyLink rejected the password and may
+    // rejoin through the same connection).
+    bool clear_retry(std::uint64_t steamid);
 
     // Set only after PartyLink has authenticated this SteamID. Until then game traffic from it
     // is dropped (net_socket's Steam hook enforces this).

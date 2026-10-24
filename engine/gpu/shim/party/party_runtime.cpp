@@ -843,6 +843,18 @@ void on_state(LinkState s, const std::string& detail) {
         if (const std::uint64_t id = net.host_steamid()) net.connect_peer(id);
     }
     bridge::OnLinkState(s, detail, link->reject_code(), reason);
+    if (steam_mode() && !host && (s == LinkState::Rejected || s == LinkState::Stopped)) {
+        auto& net = bbnet::steam::SteamNet::instance();
+        if (const std::uint64_t id = net.host_steamid()) {
+            if (s == LinkState::Rejected && link->reject_code() == RejectCode::Auth) {
+                // Keep the Steam handle for a password rejoin, but stop redialing a host that
+                // already refused this link.
+                net.clear_retry(id);
+            } else {
+                net.disconnect_peer(id);
+            }
+        }
+    }
     if (!host && s == LinkState::Rejected && link->reject_code() == RejectCode::Auth) {
         // A1 live test aid: BB_PARTY_TEST_REJOIN_PASSWORD=<password>: 20 s after a wrong-password
         // refusal, the player "types" this password in System > Party and chooses Rejoin the host.
@@ -2687,12 +2699,13 @@ bool lan_fallback(const PartyCode& code, const LinkConfig& cfg, std::array<std::
 
 void start_guest_steam(LinkConfig cfg) {
     Runtime& r = R();
+    auto& net = bbnet::steam::SteamNet::instance();
     if (cfg.password.empty()) {
+        if (const std::uint64_t id = net.host_steamid()) net.clear_retry(id);
         set_error("Steam P2P needs a party password");
         plog("Steam P2P guest: set the party password first");
         return;
     }
-    auto& net = bbnet::steam::SteamNet::instance();
     if (!net.running()) {
         set_error("Steam P2P is not running");
         plog("Steam P2P guest: %s", net.status().c_str());
@@ -2702,6 +2715,7 @@ void start_guest_steam(LinkConfig cfg) {
     std::uint32_t host_nbo = 0;
     if (!host_id || (!net.virtual_for_steamid(host_id, &host_nbo) && !net.learn_peer(host_id)) ||
         !net.virtual_for_steamid(host_id, &host_nbo)) {
+        if (host_id) net.clear_retry(host_id);
         set_error("Steam P2P cannot address the host");
         plog("Steam P2P guest: no virtual address for the host SteamID");
         return;
@@ -2735,6 +2749,7 @@ void start_guest_steam(LinkConfig cfg) {
     bbnet::party::remote_guest();
     std::string err;
     if (!link->start_guest(host_text, bbnet::steam::kVirtualPort, &err)) {
+        net.clear_retry(host_id);
         set_error("cannot join: " + err);
         plog("cannot join over Steam P2P: %s", err.c_str());
         return;
@@ -2779,6 +2794,7 @@ void wait_for_steam_join(LinkConfig cfg) {
         start_guest_steam(std::move(cfg));
         return;
     }
+    if (const std::uint64_t id = net.host_steamid()) net.disconnect_peer(id);
 }
 
 void start_guest(LinkConfig cfg) {

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "party_steam.h"
 
+#include "party_steam_retry.h"
 #include "steam_identity.h"
 #include "bbnet_internal.h"
 
@@ -118,7 +119,6 @@ struct FlatApi {
 
 constexpr auto kPollInterval = std::chrono::milliseconds(5);
 constexpr auto kStartTimeout = std::chrono::seconds(20);
-constexpr auto kRedialInterval = std::chrono::seconds(2);
 constexpr int kMaxMessages = 64;
 
 const char* connection_state_name(ESteamNetworkingConnectionState state) {
@@ -152,6 +152,9 @@ struct State {
     std::thread thread;
     std::atomic<bool> running{false};
     std::atomic<bool> stopping{false};
+    // The local Steam transport can dial: listen socket/poll group are ready. This says nothing
+    // about whether the remote host is listening; ConnectRetry handles that.
+    std::atomic<bool> host_ready{false};
     bool host = true;
     std::uint32_t appid = 480;
     std::uint64_t local_steamid = 0;
@@ -165,7 +168,7 @@ struct State {
     std::deque<PeerEvent> events;
     std::deque<JoinRequest> join_requests;
     std::deque<std::uint64_t> connect_queue;
-    std::set<std::uint64_t> pending_connects;
+    ConnectRetry retry;
     std::map<std::uint64_t, HSteamNetConnection> conn_by_peer;
     std::map<HSteamNetConnection, std::uint64_t> peer_by_conn;
     std::map<std::uint64_t, std::chrono::steady_clock::time_point> dialed_at;
@@ -288,22 +291,38 @@ bool friend_of(const FlatApi& api, ISteamFriends* friends, std::uint64_t id) {
 void drop_connection(State& s, std::uint64_t id);
 
 // Opens one Steam P2P connection. A handle that never reached Connected (ConnectP2P issued
-// before the host listened, or a status callback that never arrived) is replaced after a short
-// delay: returning at the first handle leaves the guest looping on a dead connection forever.
+// before the host listened, or a status callback that never arrived) is replaced after the
+// peer's backoff delay: returning at the first handle leaves the guest looping on a dead
+// connection forever. The peer stays in State::retry until Connected or an explicit disconnect.
 bool connect_internal(State& s, std::uint64_t id) {
     if (!id) return false;
+    const auto now = ConnectRetry::Clock::now();
     HSteamNetConnection stale = k_HSteamNetConnection_Invalid;
     {
         std::lock_guard<std::mutex> lock(s.mu);
-        s.pending_connects.erase(id);
-        if (s.connected.find(id) != s.connected.end()) return true;
+        if (!s.retry.pending(id)) return false;
+        if (s.connected.find(id) != s.connected.end()) {
+            s.retry.connected(id);
+            return true;
+        }
+        if (!s.host_ready.load(std::memory_order_acquire)) {
+            s.retry.failed(id, now);
+            return false;
+        }
         const auto it = s.conn_by_peer.find(id);
         if (it != s.conn_by_peer.end()) {
             const auto last = s.dialed_at.find(id);
             // No dial time: this is an incoming connection we accepted; it owns the peer until it
             // closes. Only a handle we dialed is replaced.
-            if (last == s.dialed_at.end()) return true;
-            if (std::chrono::steady_clock::now() - last->second < kRedialInterval) return true;
+            if (last == s.dialed_at.end()) {
+                s.retry.connected(id);
+                return true;
+            }
+            const auto wait = s.retry.backoff(id);
+            if (now - last->second < wait) {
+                s.retry.defer_at_least(id, last->second + wait);
+                return true;
+            }
             stale = it->second;
         }
     }
@@ -312,7 +331,11 @@ bool connect_internal(State& s, std::uint64_t id) {
                    static_cast<unsigned long long>(id));
         drop_connection(s, id);
     }
-    if (!s.sockets || !s.flat.connect_p2p) return false;
+    if (!s.sockets || !s.flat.connect_p2p) {
+        std::lock_guard<std::mutex> lock(s.mu);
+        s.retry.failed(id, now);
+        return false;
+    }
     SteamNetworkingIdentity ident;
     ident.SetSteamID64(id);
     const HSteamNetConnection conn = s.flat.connect_p2p(s.sockets, ident, kVirtualPort, 0, nullptr);
@@ -320,7 +343,7 @@ bool connect_internal(State& s, std::uint64_t id) {
         bbnet::log("Steam P2P: ConnectP2P to %llu returned an invalid connection",
                    static_cast<unsigned long long>(id));
         std::lock_guard<std::mutex> lock(s.mu);
-        s.dialed_at[id] = std::chrono::steady_clock::now();
+        s.retry.failed(id, now);
         return false;
     }
     if (!s.flat.set_conn_poll_group(s.sockets, conn, s.poll)) {
@@ -328,14 +351,22 @@ bool connect_internal(State& s, std::uint64_t id) {
                    static_cast<unsigned long long>(id), static_cast<unsigned>(conn));
         s.flat.close_connection(s.sockets, conn, k_ESteamNetConnectionEnd_App_Generic, "poll group", false);
         std::lock_guard<std::mutex> lock(s.mu);
-        s.dialed_at[id] = std::chrono::steady_clock::now();
+        s.retry.failed(id, now);
         return false;
     }
     {
         std::lock_guard<std::mutex> lock(s.mu);
+        const auto dialed = ConnectRetry::Clock::now();
         s.conn_by_peer[id] = conn;
         s.peer_by_conn[conn] = id;
-        s.dialed_at[id] = std::chrono::steady_clock::now();
+        s.dialed_at[id] = dialed;
+        if (stale != k_HSteamNetConnection_Invalid) {
+            // A timeout-driven redial is a failure: schedule the next attempt with more backoff.
+            s.retry.failed(id, dialed);
+        } else {
+            // Give Steam a chance to report Connected before treating the handle as stale.
+            s.retry.defer(id, dialed + s.retry.backoff(id));
+        }
     }
     bbnet::log("Steam P2P: connecting to %llu (connection %u)", static_cast<unsigned long long>(id),
                static_cast<unsigned>(conn));
@@ -384,6 +415,8 @@ void on_status(SteamNetConnectionStatusChangedCallback_t* p) {
         // (BB_PARTY_PASSWORD); no Steam friendship is required.
         if (!incoming) {
             bbnet::log("Steam P2P: %llu is opening the connection", static_cast<unsigned long long>(id));
+            std::lock_guard<std::mutex> lock(s->mu);
+            s->retry.connecting(id, ConnectRetry::Clock::now());
             return;
         }
         // Incoming connection on the listen socket: accept unconditionally at the Steam layer.
@@ -422,6 +455,7 @@ void on_status(SteamNetConnectionStatusChangedCallback_t* p) {
             s->conn_by_peer[id] = p->m_hConn;
             s->peer_by_conn[p->m_hConn] = id;
             s->dialed_at.erase(id);
+            s->retry.connected(id);
         }
         bbnet::log("Steam P2P: accepted connection %u from %llu", static_cast<unsigned>(p->m_hConn),
                    static_cast<unsigned long long>(id));
@@ -442,6 +476,7 @@ void on_status(SteamNetConnectionStatusChangedCallback_t* p) {
                 s->connected.insert(id);
                 s->book.add(id, nullptr);
                 s->events.push_back({id, true});
+                s->retry.connected(id);
             }
         }
         if (duplicate) {
@@ -470,6 +505,9 @@ void on_status(SteamNetConnectionStatusChangedCallback_t* p) {
                     s->conn_by_peer.erase(it);
                     s->connected.erase(id);
                     s->events.push_back({id, false});
+                    // Keep the peer wanted and redial after the current backoff. If the link is
+                    // being torn down, disconnect_peer has already removed it from the retry set.
+                    s->retry.failed(id, ConnectRetry::Clock::now());
                 }
             }
         }
@@ -667,6 +705,7 @@ void thread_main(Config config) {
         s.starting = false;
         s.failed = false;
         s.status = "Steam P2P ready";
+        s.host_ready.store(true, std::memory_order_release);
         s.running = true;
     }
     s.cv.notify_all();
@@ -679,10 +718,14 @@ void thread_main(Config config) {
         std::vector<std::uint64_t> connects;
         {
             std::lock_guard<std::mutex> lock(s.mu);
+            std::set<std::uint64_t> due;
             while (!s.connect_queue.empty()) {
-                connects.push_back(s.connect_queue.front());
+                due.insert(s.connect_queue.front());
                 s.connect_queue.pop_front();
             }
+            const auto now = ConnectRetry::Clock::now();
+            for (const std::uint64_t id : s.retry.due(now)) due.insert(id);
+            connects.assign(due.begin(), due.end());
         }
         for (const std::uint64_t id : connects)
             if (id != local) connect_internal(s, id);
@@ -728,10 +771,11 @@ void thread_main(Config config) {
     {
         std::lock_guard<std::mutex> lock(s.mu);
         s.running = false;
+        s.host_ready.store(false, std::memory_order_release);
         s.status = "Steam P2P stopped";
         s.connected.clear();
         s.conn_by_peer.clear();
-        s.pending_connects.clear();
+        s.retry.clear_all();
         s.dialed_at.clear();
         s.heard_from.clear();
     }
@@ -869,6 +913,12 @@ bool SteamNet::join_host(std::uint64_t steamid) {
         s->status = error;
         return false;
     }
+    if (was_host) {
+        // Old host-side dials belong to the previous role; do not let them consume the new
+        // guest's retry schedule.
+        s->retry.clear_all();
+        s->connect_queue.clear();
+    }
     if (was_host && s->sockets) {
         if (s->listen != k_HSteamListenSocket_Invalid && s->flat.close_listen_socket)
             s->flat.close_listen_socket(s->sockets, s->listen);
@@ -879,8 +929,10 @@ bool SteamNet::join_host(std::uint64_t steamid) {
                    static_cast<unsigned long long>(steamid));
     }
     s->host_steamid = steamid;
-    if (s->connected.find(steamid) == s->connected.end() && s->pending_connects.insert(steamid).second)
+    if (s->connected.find(steamid) == s->connected.end() && !s->retry.pending(steamid)) {
+        s->retry.request(steamid, ConnectRetry::Clock::now());
         s->connect_queue.push_back(steamid);
+    }
     return true;
 }
 
@@ -899,9 +951,11 @@ bool SteamNet::connect_peer(std::uint64_t steamid) {
     if (!s || !s->running.load() || !steamid || steamid == s->local_steamid) return false;
     std::lock_guard<std::mutex> lock(s->mu);
     if (s->connected.find(steamid) != s->connected.end()) return true;
-    // A handle in conn_by_peer is not enough: the worker replaces it when it never reached
-    // Connected, so every reconnect attempt re-issues ConnectP2P.
-    if (s->pending_connects.insert(steamid).second) s->connect_queue.push_back(steamid);
+    // Keep the peer wanted until Connected or an explicit disconnect. Every reconnect attempt
+    // re-issues ConnectP2P after the retry backoff.
+    if (s->retry.pending(steamid)) return true;
+    s->retry.request(steamid, ConnectRetry::Clock::now());
+    s->connect_queue.push_back(steamid);
     return true;
 }
 
@@ -913,6 +967,7 @@ bool SteamNet::disconnect_peer(std::uint64_t steamid) {
         std::lock_guard<std::mutex> lock(s->mu);
         const auto it = s->conn_by_peer.find(steamid);
         if (it != s->conn_by_peer.end()) conn = it->second;
+        s->retry.clear(steamid);
     }
     {
         std::lock_guard<std::mutex> lock(s->api_mu);
@@ -923,11 +978,20 @@ bool SteamNet::disconnect_peer(std::uint64_t steamid) {
         std::lock_guard<std::mutex> lock(s->mu);
         s->conn_by_peer.erase(steamid);
         s->peer_by_conn.erase(conn);
-        s->pending_connects.erase(steamid);
+        s->retry.clear(steamid);
         s->connected.erase(steamid);
         s->trusted.erase(steamid);
         s->heard_from.erase(steamid);
     }
+    return true;
+}
+
+bool SteamNet::clear_retry(std::uint64_t steamid) {
+    State* s = g_state;
+    if (!s || !steamid) return false;
+    std::lock_guard<std::mutex> lock(s->mu);
+    if (!s->retry.pending(steamid)) return false;
+    s->retry.clear(steamid);
     return true;
 }
 
@@ -961,7 +1025,11 @@ bool SteamNet::send(std::uint64_t steamid, const void* data, std::size_t size) {
                    static_cast<unsigned long long>(steamid), static_cast<unsigned>(conn),
                    static_cast<int>(result), static_cast<unsigned long long>(failures));
     // A dead handle would fail every send: drop it so the next reconnect re-dials.
-    if (result == k_EResultNoConnection) drop_connection(*s, steamid);
+    if (result == k_EResultNoConnection) {
+        drop_connection(*s, steamid);
+        std::lock_guard<std::mutex> lock(s->mu);
+        s->retry.failed(steamid, ConnectRetry::Clock::now());
+    }
     return false;
 }
 
@@ -1233,6 +1301,12 @@ bool SteamNet::disconnect_peer(std::uint64_t steamid) {
     return was;
 }
 
+bool SteamNet::clear_retry(std::uint64_t steamid) {
+    StubState& s = stub();
+    std::lock_guard<std::mutex> lock(s.mu);
+    return s.running && steamid != 0;
+}
+
 bool SteamNet::send(std::uint64_t steamid, const void* data, std::size_t size) {
     StubState& s = stub();
     std::lock_guard<std::mutex> lock(s.mu);
@@ -1359,6 +1433,7 @@ bool SteamNet::pop_datagram(Datagram*) { return false; }
 bool SteamNet::pop_event(PeerEvent*) { return false; }
 bool SteamNet::is_connected(std::uint64_t) const { return false; }
 bool SteamNet::disconnect_peer(std::uint64_t) { return false; }
+bool SteamNet::clear_retry(std::uint64_t) { return false; }
 void SteamNet::trust_peer(std::uint64_t) {}
 void SteamNet::set_trusted_peers(const std::vector<std::uint64_t>&) {}
 bool SteamNet::is_trusted(std::uint64_t) const { return false; }
