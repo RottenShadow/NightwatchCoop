@@ -14,6 +14,19 @@ public sealed class SeamlessPage : LauncherPage
     private readonly TextBlock _codes;
     private readonly TextBlock _status;
     private readonly DispatcherTimer _timer = new() { Interval = TimeSpan.FromSeconds(1) };
+    private readonly List<SettingRow> _directRows = new();
+    private readonly List<SettingRow> _steamRows = new();
+    private SettingRow? _modeRow;
+    private SettingRow? _nameRow;
+    private SettingRow? _hostCodeRow;
+    private SettingRow? _codesRow;
+    private SettingRow? _guestCodeRow;
+    private SettingRow? _connectGuestRow;
+    private SettingRow? _joinMemberRow;
+    private SettingRow? _steamOwnRow;
+    private TextBlock? _steamAccount;
+    private TextBlock? _steamStatusText;
+    private bool _steamBusy;
     /// Rows and group headers shown only in some modes ("" single player, "host", "join").
     private readonly List<(UIElement Element, Func<string, bool> When)> _byMode = new();
     private static bool InParty(string mode) => mode.Length > 0;
@@ -21,47 +34,67 @@ public sealed class SeamlessPage : LauncherPage
     private static bool Joining(string mode) => mode == "join";
 
     public SeamlessPage() : base("Seamless co-op",
-        "Play the campaign together with visy's seamless co-op. The host shares a party code; everyone uses the same build, gameplay mods and party size.")
+        "Play the campaign together with visy's seamless co-op. Host directly, over a VPN, or through Steam P2P. Everyone uses the same build, gameplay mods and party size.")
     {
         // Single player shows only Party saves; Join leaves out the host's rows, Host the guest's.
         Group("Party");
-        SettingCombo(SymbolRegular.People24, "Mode", "Host starts the party; Join connects to the host.",
+        _modeRow = RowOf(SettingCombo(SymbolRegular.People24, "Mode",
+            "Direct/VPN: Host starts the party; Join connects to the host. Steam P2P picks the role from the Steam overlay.",
             new[] { new Choice("Single player", ""), new Choice("Host", "host"), new Choice("Join", "join") }, "party_mode",
-            changed: ShowMode, buttons: true);
+            changed: ShowMode, buttons: true));
         var party = Rows(InParty);
-        TextRow(SymbolRegular.Person24, "Your name", "1–16 letters, numbers, underscores or hyphens.", "Hunter",
-            () => SeamlessSettings.Name(S), v => S.Set("party_name", v), party);
-        TextRow(SymbolRegular.Link24, "Host code or address", "Paste the host's Internet code, LAN code or host:port.", "BBP3-…",
-            () => S.Str("party_code"), v => S.Set("party_code", v), Rows(Joining));
+        _nameRow = RowOf(TextRow(SymbolRegular.Person24, "Your name", "1-16 letters, numbers, underscores or hyphens. Direct/VPN only: Steam P2P uses your Steam name.", "Hunter",
+            () => SeamlessSettings.Name(S), v => S.Set("party_name", v), party));
+        _hostCodeRow = RowOf(TextRow(SymbolRegular.Link24, "Host code or address", "Paste the host's Internet code, LAN code or host:port.", "BBP3-XXXX",
+            () => S.Str("party_code"), v => S.Set("party_code", v), Rows(Joining)));
         party = Rows(InParty);
-        var password = new PasswordBox { Width = 300, Password = S.PartyPassword, PlaceholderText = "Optional party password", PlaceholderEnabled = true };
+        var password = new PasswordBox { Width = 300, Password = S.PartyPassword, PlaceholderText = "Party password", PlaceholderEnabled = true };
         password.PasswordChanged += (_, _) => { S.PartyPassword = password.Password; Ws.SaveSoon(); };
-        Add(Card(SymbolRegular.Password24, "Password", "Use the same password on every PC. Stored encrypted for your Windows user.", password, out _), party);
+        Add(Card(SymbolRegular.Password24, "Password", "Required for Steam P2P; optional with a party code. Use the same password on every PC. Stored encrypted for your Windows user.", password, out _), party);
         ComboRow(SymbolRegular.People24, "Party size", "Host and guests use the same limit. Five players is experimental.",
             new[] { new Choice("2", "2"), new Choice("3", "3"), new Choice("4", "4"), new Choice("5 (experimental)", "5") },
             () => S.Str("party_max") is { Length: > 0 } n ? n : "3", v => S.Set("party_max", v), party);
 
-        _byMode.Add((Group("Connection"), InParty));
+        Group("Connection");
+        SettingCombo(SymbolRegular.Router24, "Transport", "Direct/VPN uses a party code or address. Steam P2P uses a shared password and the Steam overlay.",
+            new[] { new Choice("Direct / VPN", SeamlessSettings.TransportDirect), new Choice("Steam P2P", SeamlessSettings.TransportSteam) },
+            "party_transport", changed: () => { ShowMode(); _ = RefreshSteamAsync(); });
+
+        var appId = TextRow(SymbolRegular.Settings24, "Steam AppID", "The Steam application ID both PCs use. 480 is Spacewar, Steam's public test app.", "480",
+            () => S.Str("steam_appid") is { Length: > 0 } id ? id : "480", v => S.Set("steam_appid", v), width: 120);
+        _steamRows.Add(RowOf(appId));
+
+        _steamAccount = Text("Steam not read yet.", "Faint");
+        _steamAccount.VerticalAlignment = VerticalAlignment.Center;
+        _steamOwnRow = Add(Card(SymbolRegular.Person24, "Your Steam account",
+            "The signed-in account used for Steam P2P. Friends and the host are chosen in the Steam overlay after the game starts.",
+            Row(_steamAccount, SmallButton("Refresh", SymbolRegular.ArrowSync24, (_, _) => _ = RefreshSteamAsync())), out _));
+        _steamRows.Add(_steamOwnRow);
+
+        _steamStatusText = Text("", "Faint");
+        _steamStatusText.TextWrapping = TextWrapping.Wrap;
+        Body.Children.Add(_steamStatusText);
+
         party = Rows(InParty);
-        TextRow(SymbolRegular.Router24, "Party port", "TCP and UDP. Default: 9307.", "9307", () => S.Str("party_port"), v => S.Set("party_port", v), party, width: 120);
-        ToggleRow(SymbolRegular.Router24, "UPnP", "Map the host's port automatically.", () => SeamlessSettings.Flag(S, "party_upnp"), v => S.Set("party_upnp", v), Rows(Hosting));
+        _directRows.Add(RowOf(TextRow(SymbolRegular.Router24, "Party port", "TCP and UDP. Default: 9307.", "9307", () => S.Str("party_port"), v => S.Set("party_port", v), party, width: 120)));
+        _directRows.Add(RowOf(ToggleRow(SymbolRegular.Router24, "UPnP", "Map the host's port automatically.", () => SeamlessSettings.Flag(S, "party_upnp"), v => S.Set("party_upnp", v), Rows(Hosting))));
         party = Rows(InParty);
-        ToggleRow(SymbolRegular.Globe24, "DHT rendezvous", "Optional NAT traversal through the public BitTorrent DHT. Enable on every PC to use it.",
-            () => Ini.Get("party_rendezvous", "0") == "1", v => Ini.Set("party_rendezvous", v ? "1" : "0"), party);
+        _directRows.Add(RowOf(ToggleRow(SymbolRegular.Globe24, "DHT rendezvous", "Optional NAT traversal through the public BitTorrent DHT. Enable on every PC to use it.",
+            () => Ini.Get("party_rendezvous", "0") == "1", v => Ini.Set("party_rendezvous", v ? "1" : "0"), party)));
         // Kept in bbport.ini like the game's System > Party network rows, so both show the same value.
-        ToggleRow(SymbolRegular.People24, "Relay for party members", "A member that cannot reach the host joins through you (party members only, capped upload).",
-            () => Ini.Get("party_member_relay", "1") == "1", v => Ini.Set("party_member_relay", v ? "1" : "0"), party);
-        ToggleRow(SymbolRegular.Globe24, "IPv6", "Try IPv6 when both PCs have it. A host without an open port then puts its IPv6 address into the party code.",
-            () => Ini.Get("party_ipv6", "0") == "1", v => Ini.Set("party_ipv6", v ? "1" : "0"), party);
-        TextRow(SymbolRegular.Server24, "STUN server", "Empty uses stun.l.google.com:19302. Use off to disable.", "Default",
-            () => S.Str("party_stun"), v => S.Set("party_stun", v), party);
+        _directRows.Add(RowOf(ToggleRow(SymbolRegular.People24, "Relay for party members", "A member that cannot reach the host joins through you (party members only, capped upload).",
+            () => Ini.Get("party_member_relay", "1") == "1", v => Ini.Set("party_member_relay", v ? "1" : "0"), party)));
+        _directRows.Add(RowOf(ToggleRow(SymbolRegular.Globe24, "IPv6", "Try IPv6 when both PCs have it. A host without an open port then puts its IPv6 address into the party code.",
+            () => Ini.Get("party_ipv6", "0") == "1", v => Ini.Set("party_ipv6", v ? "1" : "0"), party)));
+        _directRows.Add(RowOf(TextRow(SymbolRegular.Server24, "STUN server", "Empty uses stun.l.google.com:19302. Use off to disable.", "Default",
+            () => S.Str("party_stun"), v => S.Set("party_stun", v), party)));
         var host = Rows(Hosting);
-        TextRow(SymbolRegular.Globe24, "Host public address", "Leave on Automatic unless guests reach you another way: your VPN address (Radmin VPN, Tailscale, ZeroTier), or your public IP or DNS name when you forwarded the port yourself (host or host:port). The party code then carries it.", "Automatic",
-            () => S.Str("party_public_addr"), v => S.Set("party_public_addr", v), host);
+        _directRows.Add(RowOf(TextRow(SymbolRegular.Globe24, "Host public address", "Leave on Automatic unless guests reach you another way: your VPN address (Radmin VPN, Tailscale, ZeroTier), or your public IP or DNS name when you forwarded the port yourself (host or host:port). The party code then carries it.", "Automatic",
+            () => S.Str("party_public_addr"), v => S.Set("party_public_addr", v), host)));
         _codes = Text("", "Faint");
         _codes.TextWrapping = TextWrapping.Wrap;
         host.Children.Add(_codes);
-        Add(Card(SymbolRegular.Copy24, "Share party codes", "Available after the host starts. Use the LAN code on the same router.",
+        _codesRow = Add(Card(SymbolRegular.Copy24, "Share party codes", "Available after the host starts. Use the LAN code on the same router.",
             SmallButton("Copy codes", SymbolRegular.Copy24, (_, _) => Clipboard.SetText(SeamlessSettings.Codes(S))), out _), host);
 
         party = Rows(InParty);
@@ -90,7 +123,7 @@ public sealed class SeamlessPage : LauncherPage
                     catch (Exception e) { Prompt.Tell("Party", e.Message); }
                 }
             }), out _), host);
-        Add(Card(SymbolRegular.Link24, "Connect a guest", "Host: copy the guest's BBG1 code first, then add it here.",
+        _connectGuestRow = Add(Card(SymbolRegular.Link24, "Connect a guest", "Host: copy the guest's BBG1 code first, then add it here.",
             SmallButton("Add copied guest code", SymbolRegular.Link24, (_, _) => {
                 try {
                     var code = Clipboard.GetText();
@@ -102,13 +135,13 @@ public sealed class SeamlessPage : LauncherPage
             }), out _), host);
 
         var join = Rows(Joining);
-        Add(Card(SymbolRegular.Link24, "Guest connection code", "Guests can share this with a host when NAT prevents a direct connection.",
+        _guestCodeRow = Add(Card(SymbolRegular.Link24, "Guest connection code", "Guests can share this with a host when NAT prevents a direct connection.",
             SmallButton("Copy guest code", SymbolRegular.Copy24, (_, _) => {
                 var code = SeamlessSession.Read(S)?.guest_code;
                 if (string.IsNullOrEmpty(code)) Prompt.Tell("Party", "No guest connection code is available yet.");
                 else Clipboard.SetText(code);
             }), out _), join);
-        Add(Card(SymbolRegular.Link24, "Join through a member", "Guest: when the host cannot be reached but another member can, copy that member's guest code and add it here.",
+        _joinMemberRow = Add(Card(SymbolRegular.Link24, "Join through a member", "Guest: when the host cannot be reached but another member can, copy that member's guest code and add it here.",
             SmallButton("Add copied member code", SymbolRegular.Link24, (_, _) => {
                 try {
                     var code = Clipboard.GetText();
@@ -209,7 +242,13 @@ public sealed class SeamlessPage : LauncherPage
                 string.Join("\n", status.members.Select(m => $"{m.name}: {(m.in_world ? "in host world" : m.connected ? "connected" : "disconnected")}  {(m.ping_ms < 0 ? "" : m.ping_ms + " ms")}  {m.area}")) +
                 $"\n{status.@event}\n{status.alert}";
         };
-        Loaded += (_, _) => { _codes.Text = SeamlessSettings.Codes(S); _timer.Start(); };
+        Loaded += (_, _) =>
+        {
+            _codes.Text = SeamlessSettings.Codes(S);
+            ShowMode();
+            if (SeamlessSettings.SteamMode(S)) _ = RefreshSteamAsync();
+            _timer.Start();
+        };
         Unloaded += (_, _) => _timer.Stop();
         ShowMode();
     }
@@ -223,9 +262,74 @@ public sealed class SeamlessPage : LauncherPage
     }
     private void ShowMode()
     {
-        var mode = S.Str("party_mode");
+        var steam = SeamlessSettings.SteamMode(S);
+        var mode = steam ? "steam" : S.Str("party_mode");
         foreach (var (element, when) in _byMode)
             element.Visibility = when(mode) ? Visibility.Visible : Visibility.Collapsed;
+        foreach (var row in _directRows)
+            row.Visibility = steam ? Visibility.Collapsed : Visibility.Visible;
+        foreach (var row in _steamRows)
+            row.Visibility = steam ? Visibility.Visible : Visibility.Collapsed;
+        Show(_modeRow, !steam);
+        Show(_nameRow, !steam);
+        Show(_hostCodeRow, !steam);
+        Show(_codesRow, !steam);
+        Show(_guestCodeRow, !steam);
+        Show(_connectGuestRow, !steam);
+        Show(_joinMemberRow, !steam);
+        Show(_steamOwnRow, steam);
+        _codes.Visibility = steam ? Visibility.Collapsed : Visibility.Visible;
+        if (_steamStatusText != null)
+        {
+            _steamStatusText.Visibility = steam ? Visibility.Visible : Visibility.Collapsed;
+            if (!steam) _steamStatusText.Text = "";
+        }
+    }
+
+    private static void Show(SettingRow? row, bool shown)
+    {
+        if (row != null) row.Visibility = shown ? Visibility.Visible : Visibility.Collapsed;
+    }
+
+    private async Task RefreshSteamAsync()
+    {
+        if (!SeamlessSettings.SteamMode(S) || _steamBusy) return;
+
+        _steamBusy = true;
+        if (_steamStatusText != null) _steamStatusText.Text = "Reading Steam...";
+        try
+        {
+            var appid = SeamlessSettings.SteamAppId(S);
+            var snapshot = await Task.Run(() => SteamAccount.Read(appid));
+            if (!SeamlessSettings.SteamMode(S)) return;
+            var partyName = SteamAccount.PartyName(snapshot.LocalName);
+            if (_steamAccount != null)
+                _steamAccount.Text = snapshot.LocalId == 0 ? L.T("Steam unavailable") :
+                    $"{snapshot.LocalName}  ({snapshot.LocalId})  -  {L.T("in game as")} {partyName}";
+            if (_steamStatusText != null)
+            {
+                _steamStatusText.Text = snapshot.Error.Length > 0 ? SteamAccount.Problem(snapshot) :
+                    L.F($"Steam: {snapshot.LocalName}, in game as {partyName}. Start the game to host; choose Join Game on a friend to join them instead.");
+            }
+        }
+        finally
+        {
+            _steamBusy = false;
+        }
+    }
+
+    /// <summary>Shows why Play stopped before the engine started (Steam closed, no signed-in account).</summary>
+    public void ShowSteamProblem(string problem)
+    {
+        if (_steamAccount != null) _steamAccount.Text = L.T("Steam unavailable");
+        if (_steamStatusText != null) _steamStatusText.Text = problem;
+    }
+
+    private static SettingRow RowOf(FrameworkElement control)
+    {
+        for (DependencyObject? at = control; at != null; at = at is FrameworkElement element ? element.Parent : LogicalTreeHelper.GetParent(at))
+            if (at is SettingRow row) return row;
+        throw new InvalidOperationException("The setting control is not inside a row.");
     }
     /// Switches kept in bbport.ini like the game's party pages, so both show the same value.
     private void IniToggles(Panel into, params (string Key, string Label, bool Fallback)[] rows)

@@ -250,6 +250,9 @@ struct LinkConfig {
     // (set_udp_transport) the link uses its own UDP socket on the same port number.
     bool udp_link = true;
     int tcp_fallback_ms = 1500;
+    // Guest: the host address is a Steam synthetic 198.18/15 address. There is no TCP listener
+    // behind it, so start_guest skips the dial and starts directly on the rUDP path.
+    bool steam_link = false;
     // Guest: the DHT rendezvous (party_rdv.h, opt-in) announces us, so a host without an open port
     // can find us; only changes the failure hint (host_no_answer_hint).
     bool auto_punch = false;

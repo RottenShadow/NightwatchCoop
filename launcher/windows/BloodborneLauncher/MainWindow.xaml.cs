@@ -805,6 +805,19 @@ namespace BloodborneLauncher
                 Show("seamless");
                 return;
             }
+            SteamAccount.Snapshot? steam = null;
+            if (SeamlessSettings.SteamMode(s))
+            {
+                steam = await Task.Run(() => SteamAccount.Read(SeamlessSettings.SteamAppId(s)));
+                if (steam.LocalId == 0)
+                {
+                    var problem = SteamAccount.Problem(steam);
+                    Prompt.Tell(L.T("Steam P2P"), problem);
+                    Show("seamless");
+                    if (PageOf(typeof(SeamlessPage)) is SeamlessPage page) page.ShowSteamProblem(problem);
+                    return;
+                }
+            }
             // No public online play (no shadNet, no The Hunter's Dream): co-op is the party's own.
             ini.Set("online_enabled", "0");
             ini.Set("online_pool", "");
@@ -960,7 +973,7 @@ namespace BloodborneLauncher
                 if (!start) return;
             }
 
-            var error = ws.StartGame();
+            var error = ws.StartGame(steam);
             if (error != null)
             {
                 System.Windows.MessageBox.Show(this, error, L.T("Could not start the game"), MessageBoxButton.OK, MessageBoxImage.Warning);

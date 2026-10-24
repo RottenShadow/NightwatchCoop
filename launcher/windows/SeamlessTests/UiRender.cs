@@ -17,10 +17,20 @@ internal static class UiRender
                 Directory.CreateDirectory(directory);
                 var app = new BloodborneLauncher.App();
                 app.InitializeComponent();
-                // Each mode shows its own rows: Host and Join their party rows, single player only the saves.
-                foreach (var (mode, name) in new[] { ("host", "host"), ("join", "join"), ("", "single") })
+                // Each mode shows its own rows: Host and Join their party rows, single player only the saves,
+                // Steam P2P the account rows instead of the direct-only Host/Join and party name rows.
+                foreach (var (mode, name) in new[] { ("host", "host"), ("join", "join"), ("", "single"), ("steam", "steam") })
                 {
-                    BloodborneLauncher.Core.Workspace.Current.Settings.Set("party_mode", mode);
+                    var steam = mode == "steam";
+                    var settings = BloodborneLauncher.Core.Workspace.Current.Settings;
+                    settings.Set("party_mode", steam ? "" : mode);
+                    settings.Set("party_transport", steam ? "steam" : "direct");
+                    if (steam)
+                    {
+                        settings.Set("party_name", "Join_Test");
+                        settings.Set("steam_appid", "480");
+                        settings.PartyPassword = "steam secret";
+                    }
                     var page = new SeamlessPage();
                     page.RaiseEvent(new RoutedEventArgs(FrameworkElement.LoadedEvent));
                     var scroll = (ScrollViewer)page.Content;
@@ -30,7 +40,18 @@ internal static class UiRender
                     surface.Measure(new Size(920, 760));
                     surface.Arrange(new Rect(0, 0, 920, 760));
                     surface.UpdateLayout();
-                    if (mode.Length > 0 && scroll.ExtentHeight <= scroll.ViewportHeight) throw new InvalidOperationException("Party settings did not lay out.");
+                    if (steam)
+                    {
+                        var nameRow = Descendants(surface).OfType<SettingRow>().FirstOrDefault(row => row.Title == "Your name")
+                            ?? throw new InvalidOperationException("The party name row is missing.");
+                        if (nameRow.Visibility == Visibility.Visible)
+                            throw new InvalidOperationException("The direct-only party name row is visible in Steam mode.");
+                        var modeRow = Descendants(surface).OfType<SettingRow>().FirstOrDefault(row => row.Title == "Mode")
+                            ?? throw new InvalidOperationException("The party mode row is missing.");
+                        if (modeRow.Visibility == Visibility.Visible)
+                            throw new InvalidOperationException("The Host/Join mode row is visible in Steam mode.");
+                    }
+                    if ((mode.Length > 0 || steam) && scroll.ExtentHeight <= scroll.ViewportHeight) throw new InvalidOperationException("Party settings did not lay out.");
                     foreach (var (label, fraction) in new[] { ("party", 0.0), ("rules", 0.5), ("saves", 1.0) })
                     {
                         scroll.ScrollToVerticalOffset(scroll.ScrollableHeight * fraction);
@@ -43,7 +64,8 @@ internal static class UiRender
                         encoder.Save(output);
                     }
                 }
-                Console.WriteLine("PASS: seamless settings render for host, join and single player without showing a window");
+                BloodborneLauncher.Core.Workspace.Current.Settings.Set("party_transport", "direct");
+                Console.WriteLine("PASS: seamless settings render for host, join, single player and Steam without showing a window");
 
                 // The other settings pages build and lay out too (their first and last screen).
                 foreach (var type in new[] { typeof(DisplayPage), typeof(GraphicsPage), typeof(ControlsPage), typeof(TrophiesPage),
@@ -81,6 +103,15 @@ internal static class UiRender
         if (failure != null) throw new InvalidOperationException("Launcher rendering failed", failure);
     }
 
+    private static IEnumerable<DependencyObject> Descendants(DependencyObject root)
+    {
+        for (var i = 0; i < VisualTreeHelper.GetChildrenCount(root); i++)
+        {
+            var child = VisualTreeHelper.GetChild(root, i);
+            yield return child;
+            foreach (var descendant in Descendants(child)) yield return descendant;
+        }
+    }
     private static ScrollViewer? FindScroll(object at) => at as ScrollViewer ??
         (at is DependencyObject parent ? LogicalTreeHelper.GetChildren(parent).Cast<object>().Select(FindScroll).FirstOrDefault(s => s != null) : null);
 }

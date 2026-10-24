@@ -46,6 +46,8 @@
 #include "../net/party_route.h"
 #include "../net/party_transport.h"
 #include "../net/party_util.h"
+#include "net/steam_identity.h"
+#include "net/party_steam.h"
 #include "../../bbnet.h"
 
 #include <algorithm>
@@ -65,6 +67,8 @@
 #include <mutex>
 #include <sstream>
 #include <thread>
+
+[[noreturn]] void BbHardExit(int code);  // shim/bbgpu.cpp
 
 #if defined(_WIN32)
 #ifndef NOMINMAX
@@ -105,7 +109,9 @@ bool env_on(const char* name) {
 }
 
 bool loopback_mode() { return env_on("BB_PARTY_LOOPBACK") || env_on("BB_MP_LOCAL_TEST"); }
+bool steam_mode() { return bbnet::settings().steam; }
 void nr_fast_expire(const std::string& name);  // below (C6)
+void start_guest_steam(LinkConfig cfg);        // below: the Steam guest link
 
 std::string lower(std::string s) {
     for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
@@ -446,6 +452,13 @@ struct Runtime {
     Clock::time_point lost_at{};
     bool outage = false;  // guest: the link went silent ("no traffic"): the outage hold runs
     std::uint64_t loss_epoch = 0;  // guest: +1 per loss of a connected link (its host-lost timer's)
+    // Steam P2P: Join Game while hosting, switched in place (runtime_steam_join_tick).
+    bool steam_switch_pending = false;    // accepted; waiting for the world / the session to end
+    std::uint64_t steam_switch_steamid = 0;
+    std::string steam_switch_connect;
+    bool steam_switch_leave = false;      // the game's session is being ended before the switch
+    Clock::time_point steam_switch_left_at{};
+    bool steam_switch_armed_join = false; // guest now: ask the new host for its room when connected
 };
 
 std::mutex g_marker_mu;  // serializes marker writes (startup thread, link callback thread)
@@ -825,6 +838,10 @@ void on_state(LinkState s, const std::string& detail) {
             bbnet::session::host_session_reset();  // a context the game already started: our own service now
         }
     }
+    if (steam_mode() && !host && (s == LinkState::Connecting || s == LinkState::Reconnecting)) {
+        auto& net = bbnet::steam::SteamNet::instance();
+        if (const std::uint64_t id = net.host_steamid()) net.connect_peer(id);
+    }
     bridge::OnLinkState(s, detail, link->reject_code(), reason);
     if (!host && s == LinkState::Rejected && link->reject_code() == RejectCode::Auth) {
         // A1 live test aid: BB_PARTY_TEST_REJOIN_PASSWORD=<password>: 20 s after a wrong-password
@@ -964,9 +981,11 @@ void on_state(LinkState s, const std::string& detail) {
         if (fresh) {
             // Join party after Leave (live: the host's game could not resolve us, 'not registered',
             // and its summons never arrived): our NP context and relay registration again
-            // (after the RPC is wired to the new link).
+            // (after the RPC is wired to the new link). A switched Steam guest also has a new
+            // transport object: the game's Np event handler is subscribed on it again.
             plog("rejoined after Leave: registering our session with the host again");
             bbnet::session::host_session_reset();
+            bbnet::np::matching2_events_restart();
         }
         break;
     }
@@ -1005,12 +1024,13 @@ void on_split_choosing(int slot, const std::string& body) {
 void on_roster(const std::vector<RosterEntry>& roster) {
     Runtime& r = R();
     const std::string sig = roster_text(roster, false);
-    bool log_it = false;
+    bool log_it = false, changed = false;
     {
         std::lock_guard<std::mutex> lk(r.mu);
         r.st.roster = roster;
         const auto now = Clock::now();
-        if (sig != r.roster_sig || now - r.last_roster_log >= std::chrono::seconds(15)) {
+        changed = sig != r.roster_sig;
+        if (changed || now - r.last_roster_log >= std::chrono::seconds(15)) {
             r.roster_sig = sig;
             r.last_roster_log = now;
             log_it = true;
@@ -1023,6 +1043,46 @@ void on_roster(const std::vector<RosterEntry>& roster) {
             if (e.slot == kHostSlot) rg->set_host_online_id(e.name);
     }
     PartyLink* link = runtime_link();
+    if (steam_mode() && link) {
+        auto& net = bbnet::steam::SteamNet::instance();
+        const bool host_role = link->is_host();
+        std::vector<std::uint64_t> trusted;
+        for (const RosterEntry& e : roster) {
+            if (!e.connected) continue;
+            std::uint64_t id = 0;
+            if (e.slot == kHostSlot) id = host_role ? net.local_steamid() : net.host_steamid();
+            else if (const std::uint32_t ip = link->member_ip(e.slot)) net.steamid_for_virtual(ip, &id);
+            if (id) trusted.push_back(id);
+        }
+        if (host_role) {
+            net.set_trusted_peers(trusted);
+        } else {
+            for (const std::uint64_t id : trusted) net.trust_peer(id);
+        }
+        if (changed && host_role) {
+            // The host vouches only for members that passed PartyLink AUTH. A guest uses this
+            // list to reach the other guests directly over Steam.
+            json::Value members = json::Value::make_array();
+            if (const std::uint64_t own = net.local_steamid()) {
+                json::Value m = json::Value::make_object();
+                m.set("Id", std::to_string(own));
+                m.set("Name", bbnet::settings().online_id);
+                members.push(std::move(m));
+            }
+            for (const RosterEntry& e : roster) {
+                if (!e.connected || e.slot == kHostSlot) continue;
+                std::uint64_t id = 0;
+                if (!net.steamid_for_virtual(link->member_ip(e.slot), &id)) continue;
+                json::Value m = json::Value::make_object();
+                m.set("Id", std::to_string(id));
+                m.set("Name", e.name);
+                members.push(std::move(m));
+            }
+            json::Value body = json::Value::make_object();
+            body.set("Members", std::move(members));
+            link->send_event(kBroadcast, netroute::kSteamPeersEvent, json::dump(body, 0));
+        }
+    }
     // C6 on the OTHER guests (confid 2026-10-16, repeat_party c6 --players 3: 2 of 3 crash rejoins
     // failed): a member whose game crashed comes back at its title from the same address and port.
     // The host releases its game connection to the dead game (NrDropSilentPeers from on_member_left),
@@ -1095,6 +1155,13 @@ LinkCallbacks make_callbacks(bool host) {
     if (host) {
         cb.on_member_joined = [](const RosterEntry& m, bool rejoined) {
             plog("%s %s (slot %d)", m.name.c_str(), rejoined ? "is back" : "joined", m.slot);
+            if (steam_mode()) {
+                PartyLink* l = runtime_link();
+                std::uint64_t id = 0;
+                if (l && l->member_ip(m.slot) &&
+                    bbnet::steam::SteamNet::instance().steamid_for_virtual(l->member_ip(m.slot), &id))
+                    bbnet::steam::SteamNet::instance().trust_peer(id);
+            }
             std::string why;
             {
                 std::lock_guard<std::mutex> lk(g_lost_mu);
@@ -1665,33 +1732,58 @@ void start_host_rendezvous(const std::string& password, const std::array<std::ui
 void start_host(LinkConfig cfg) {
     Runtime& r = R();
     const bool lb = loopback_mode();
+    const bool steam = steam_mode();
     std::vector<KeptMember> kept;
     std::string from;
     const bool restarted = restart_info().restarted;
-    const std::string menu_secret = flow::RuntimeHostSecret();
-    // The party code stays the same from one launch to the next (party_code.h pick_host_secret)
-    // until the host asks for a new one; only a crash restart keeps the member slots too.
-    std::array<std::uint8_t, 8> restart_secret{};
-    const bool have_restart = restarted && previous_party(&restart_secret, &kept, &from);
-    std::string saved_text;
-    read_file(fs::path(user_dir()) / "party_secret.txt", &saved_text);
-    const HostSecretFrom src =
-        pick_host_secret(have_restart ? &restart_secret : nullptr, menu_secret, saved_text, &cfg.secret);
-    if (src == HostSecretFrom::CrashRestart) {
-        plog("restarted host: keeping the party code (secret from %s) and %zu member slot(s)", from.c_str(), kept.size());
-    } else if (src == HostSecretFrom::Menu) {
-        plog("party game from the menu: the party code of the last session (secret from party.json)");
-    } else if (src == HostSecretFrom::Saved) {
-        plog("hosting again: the same party code as last time (secret from party_secret.txt; New party code in the "
-             "launcher or System > Party mode makes a new one)");
+    if (steam) {
+        if (cfg.password.empty()) {
+            set_error("Steam P2P needs a party password");
+            plog("Steam P2P host: set the party password first");
+            return;
+        }
+        auto& net = bbnet::steam::SteamNet::instance();
+        if (!net.running() || !net.local_steamid()) {
+            set_error("Steam P2P is not running");
+            plog("Steam P2P host: %s", net.status().c_str());
+            return;
+        }
+        cfg.secret = bbnet::steam::party_secret(cfg.password, net.local_steamid(), bbnet::settings().steam_appid);
+        if (restarted) {
+            std::array<std::uint8_t, 8> previous{};
+            if (previous_party(&previous, &kept, &from)) {
+                plog("restarted Steam P2P host: keeping %zu member slot(s)", kept.size());
+            }
+        }
+        plog("Steam P2P host: virtual address %s, party secret derived from the password",
+             bbnet::steam::synthetic_text(net.local_steamid()).c_str());
     } else {
-        plog("a new party code (none saved): send it to your friends");
+        const std::string menu_secret = flow::RuntimeHostSecret();
+        // The party code stays the same from one launch to the next (party_code.h pick_host_secret)
+        // until the host asks for a new one; only a crash restart keeps the member slots too.
+        std::array<std::uint8_t, 8> restart_secret{};
+        const bool have_restart = restarted && previous_party(&restart_secret, &kept, &from);
+        std::string saved_text;
+        read_file(fs::path(user_dir()) / "party_secret.txt", &saved_text);
+        const HostSecretFrom src =
+            pick_host_secret(have_restart ? &restart_secret : nullptr, menu_secret, saved_text, &cfg.secret);
+        if (src == HostSecretFrom::CrashRestart) {
+            plog("restarted host: keeping the party code (secret from %s) and %zu member slot(s)", from.c_str(),
+                 kept.size());
+        } else if (src == HostSecretFrom::Menu) {
+            plog("party game from the menu: the party code of the last session (secret from party.json)");
+        } else if (src == HostSecretFrom::Saved) {
+            plog("hosting again: the same party code as last time (secret from party_secret.txt; New party code in the "
+                 "launcher or System > Party mode makes a new one)");
+        } else {
+            plog("a new party code (none saved): send it to your friends");
+        }
+        if (src != HostSecretFrom::CrashRestart) kept.clear();
+        fit_secret_logged(&cfg.secret, !cfg.password.empty());
+        flow::StoreHostSecret(hex_of(cfg.secret.data(), cfg.secret.size()));
+        // <user>/party_secret.txt: every launch's source (the restart's second one after the marker).
+        write_text_file(fs::path(user_dir()) / "party_secret.txt", hex_of(cfg.secret.data(), cfg.secret.size()) + "\n");
     }
-    if (src != HostSecretFrom::CrashRestart) kept.clear();
-    fit_secret_logged(&cfg.secret, !cfg.password.empty());
-    flow::StoreHostSecret(hex_of(cfg.secret.data(), cfg.secret.size()));
-    // <user>/party_secret.txt: every launch's source (the restart's second one after the marker).
-    write_text_file(fs::path(user_dir()) / "party_secret.txt", hex_of(cfg.secret.data(), cfg.secret.size()) + "\n");
     {
         std::lock_guard<std::mutex> lk(r.mu);
         r.secret = cfg.secret;
@@ -1700,6 +1792,10 @@ void start_host(LinkConfig cfg) {
     if (lb) cfg.bind_addr = "127.0.0.1";  // local test: nothing on the network (no firewall prompt)
     const std::string name = cfg.name;
     const std::uint16_t port = cfg.port;
+    // Steam P2P carries every party frame over the Steam connection, so the link's own
+    // TCP/UDP sockets are unused. Bind them to an ephemeral port so a stale direct-mode
+    // listener cannot block hosting.
+    if (steam) cfg.port = 0;
 
     // The game's party UDP port first: STUN below goes out from it (so the mapping is that
     // port's) and the host's STUN responder / relay is up before any guest asks. The TCP link
@@ -1710,13 +1806,15 @@ void start_host(LinkConfig cfg) {
     cfg.throttle_key = [](std::uint32_t ip, std::uint16_t port) { return bbnet::p2p_router().throttle_key(ip, port); };
     auto* link = new PartyLink(cfg, make_callbacks(true));
     attach_udp_path(link);
-    if (const char* gc = env("BB_PARTY_GUEST_CODES")) add_guest_code_text(gc);
-    std::thread([] {  // guest codes: punch towards each new one (env, file, menu)
-        while (!stopping()) {
-            punch_guest_codes_tick();
-            std::this_thread::sleep_for(std::chrono::milliseconds(500));
-        }
-    }).detach();
+    if (!steam) {
+        if (const char* gc = env("BB_PARTY_GUEST_CODES")) add_guest_code_text(gc);
+        std::thread([] {  // guest codes: punch towards each new one (env, file, menu)
+            while (!stopping()) {
+                punch_guest_codes_tick();
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            }
+        }).detach();
+    }
     {
         std::lock_guard<std::mutex> lk(r.mu);
         r.link = link;
@@ -1754,8 +1852,10 @@ void start_host(LinkConfig cfg) {
     }
     coop::PartyDirector::Get().SetLink(link);
     write_marker();
-    lan_responder_start(cfg, lb);
-    netroute::HostStart(lb, cfg.password, cfg.secret);  // F2 (0.7.1): IPv6, guests relayed by a member
+    if (!steam) {
+        lan_responder_start(cfg, lb);
+        netroute::HostStart(lb, cfg.password, cfg.secret);  // F2 (0.7.1): IPv6, guests relayed by a member
+    }
 
     bbnet::party::PartyHostService& svc = bbnet::party::PartyHostService::instance();
     svc.set_loading_query([](const std::string& id) {
@@ -1776,6 +1876,34 @@ void start_host(LinkConfig cfg) {
         return false;
     });
     bbnet::party::transport();  // LocalHost over the service
+
+    if (steam) {
+        auto& net = bbnet::steam::SteamNet::instance();
+        std::uint32_t virtual_nbo = 0;
+        if (!net.virtual_for_steamid(net.local_steamid(), &virtual_nbo)) {
+            set_error("Steam P2P has no virtual address for this host");
+            return;
+        }
+        const std::string endpoint = bbnet::steam::nbo_text(virtual_nbo);
+        svc.set_host_endpoint(name, endpoint, bbnet::steam::kVirtualPort);
+        bbnet::session::set_mapped_override(endpoint, bbnet::steam::kVirtualPort);
+        const std::string line = "Steam P2P: " + net.status();
+        {
+            std::lock_guard<std::mutex> lk(r.mu);
+            r.codes.on = false;
+            r.st.local_slot = 0;
+            r.st.public_address = "Steam P2P";
+            r.st.upnp = "off (Steam P2P)";
+            r.st.network = line;
+        }
+        bridge::OnNetwork(line);
+        write_code_files({}, {});
+        plog("Steam P2P host ready at %s:%u; %s", endpoint.c_str(), bbnet::steam::kVirtualPort, net.status().c_str());
+        // Starting the game hosts, but the Steam overlay can still pull us into a friend's
+        // session: Join Game requests are polled on the director's tick and the switch happens
+        // in place (runtime_steam_join_tick), the host's world stays loaded.
+        return;
+    }
 
     std::string upnp_ip, upnp_msg;
     bool upnp_ok = false;
@@ -2557,8 +2685,113 @@ bool lan_fallback(const PartyCode& code, const LinkConfig& cfg, std::array<std::
     return false;
 }
 
+void start_guest_steam(LinkConfig cfg) {
+    Runtime& r = R();
+    if (cfg.password.empty()) {
+        set_error("Steam P2P needs a party password");
+        plog("Steam P2P guest: set the party password first");
+        return;
+    }
+    auto& net = bbnet::steam::SteamNet::instance();
+    if (!net.running()) {
+        set_error("Steam P2P is not running");
+        plog("Steam P2P guest: %s", net.status().c_str());
+        return;
+    }
+    const std::uint64_t host_id = net.host_steamid();
+    std::uint32_t host_nbo = 0;
+    if (!host_id || (!net.virtual_for_steamid(host_id, &host_nbo) && !net.learn_peer(host_id)) ||
+        !net.virtual_for_steamid(host_id, &host_nbo)) {
+        set_error("Steam P2P cannot address the host");
+        plog("Steam P2P guest: no virtual address for the host SteamID");
+        return;
+    }
+    const std::string host_text = bbnet::steam::nbo_text(host_nbo);
+    cfg.secret = bbnet::steam::party_secret(cfg.password, host_id, bbnet::settings().steam_appid);
+    cfg.udp_link = true;
+    cfg.tcp_fallback_ms = 0;  // no TCP to a virtual address: the UDP path carries every frame
+    cfg.steam_link = true;    // start_guest skips the TCP dial for the synthetic address
+    cfg.auto_punch = false;
+    if (!bbnet::p2p_open()) plog("warning: cannot open the party UDP port %u (another program?)", cfg.port);
+    auto* link = new PartyLink(cfg, make_callbacks(false));
+    attach_udp_path(link);
+    {
+        std::lock_guard<std::mutex> lk(r.mu);
+        r.link = link;
+        r.host_ip_nbo = host_nbo;
+        r.code_coded = true;
+        r.code_needs_password = true;
+        r.sent_password = true;
+        r.code_ignores_password = false;
+        r.flow_password_at_start = flow::RuntimePassword();
+        r.host_port = bbnet::steam::kVirtualPort;
+        r.st.host_address = host_text + ":" + std::to_string(bbnet::steam::kVirtualPort);
+        r.cfg = cfg;
+        r.have_cfg = true;
+    }
+    bridge::OnHostAddress(r.st.host_address);
+    plog("Steam P2P: joining host %llu at %s:%u", static_cast<unsigned long long>(host_id), host_text.c_str(),
+         bbnet::steam::kVirtualPort);
+    bbnet::party::remote_guest();
+    std::string err;
+    if (!link->start_guest(host_text, bbnet::steam::kVirtualPort, &err)) {
+        set_error("cannot join: " + err);
+        plog("cannot join over Steam P2P: %s", err.c_str());
+        return;
+    }
+    coop::PartyDirector::Get().SetLink(link);
+}
+
+// A Steam-mode guest starts the game first and joins from the Steam overlay: the launcher no
+// longer asks for the host's SteamID. Wait for GameRichPresenceJoinRequested_t, then run the
+// normal Steam guest link (the password set in the launcher is still required).
+void wait_for_steam_join(LinkConfig cfg) {
+    Runtime& r = R();
+    auto& net = bbnet::steam::SteamNet::instance();
+    const std::string line = "Steam P2P: waiting for Join Game in the Steam friends overlay";
+    {
+        std::lock_guard<std::mutex> lk(r.mu);
+        r.st.public_address = "Steam P2P";
+        r.st.upnp = "off (Steam P2P)";
+        r.st.network = line;
+        r.st.host_address = "Steam P2P overlay";
+    }
+    bridge::OnNetwork(line);
+    plog("Steam P2P guest: waiting for Join Game in the Steam friends overlay");
+    while (!stopping()) {
+        bbnet::steam::JoinRequest request;
+        if (!net.pop_join_request(&request)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            continue;
+        }
+        if (!request.steamid) {
+            plog("Steam P2P: ignoring Join Game without a SteamID");
+            continue;
+        }
+        if (!net.join_host(request.steamid)) {
+            plog("Steam P2P: Join Game from %llu rejected: %s",
+                 static_cast<unsigned long long>(request.steamid), net.status().c_str());
+            continue;
+        }
+        net.learn_peer(request.steamid);
+        plog("Steam P2P: Join Game from %llu (%s)", static_cast<unsigned long long>(request.steamid),
+             request.connect.c_str());
+        start_guest_steam(std::move(cfg));
+        return;
+    }
+}
+
 void start_guest(LinkConfig cfg) {
     Runtime& r = R();
+    if (steam_mode()) {
+        auto& net = bbnet::steam::SteamNet::instance();
+        if (!net.host_steamid()) {
+            std::thread([cfg = std::move(cfg)]() mutable { wait_for_steam_join(std::move(cfg)); }).detach();
+            return;
+        }
+        start_guest_steam(std::move(cfg));
+        return;
+    }
     PartyCode code;
     std::string err, code_text;
     if (!guest_code(&code, &err, &code_text)) {
@@ -2682,6 +2915,31 @@ void startup_main() {
         if (!env("BB_PARTY_LOCAL_IP")) _putenv_s("BB_PARTY_LOCAL_IP", "127.0.0.1");
 #endif
     }
+    if (s.steam) {
+        bbnet::steam::Config sc;
+        sc.appid = s.steam_appid;
+        sc.host = s.host;
+        std::string err;
+        plog("Steam P2P: starting (AppID %u, %s)", sc.appid, s.host ? "host" : "guest");
+        if (!bbnet::steam::SteamNet::instance().start(sc, &err)) {
+            if (err.empty()) err = "unknown error";
+            const bool unavailable = err.find("steam_api64.dll") != std::string::npos ||
+                                     err.find("SteamAPI_InitFlat") != std::string::npos ||
+                                     err.find("not running") != std::string::npos ||
+                                     err.find("not logged in") != std::string::npos ||
+                                     err.find("did not return a SteamID") != std::string::npos ||
+                                     err.find("timed out") != std::string::npos;
+            const std::string why = (unavailable ? "Steam not open: " : "Steam P2P failed: ") + err;
+            set_error(why);
+            plog("STOP: %s", why.c_str());
+            BbHardExit(23);
+        }
+        auto& net = bbnet::steam::SteamNet::instance();
+        plog("Steam P2P: %s; local SteamID %llu", net.status().c_str(),
+             static_cast<unsigned long long>(net.local_steamid()));
+        // No boot-time dial: Join Game in the Steam overlay is the only join trigger (the host
+        // link starts once the request arrives; see runtime_steam_join_tick).
+    }
     LinkConfig cfg;
     apply_link_env(cfg);
     if (cfg.password.empty()) cfg.password = flow::RuntimePassword();  // the party flow's (party.json)
@@ -2773,6 +3031,7 @@ void do_shutdown() {
     }
     traversal::stop();
     netroute::Stop();
+    bbnet::steam::SteamNet::instance().stop();
     if (upnp) upnp->stop(2000);
 }
 
@@ -2843,6 +3102,7 @@ void rejoin_main() {
     if (old) old->stop(true);  // a Rejected / Stopped link: only joins its threads
     bridge::OnRejoining();
     auto* link = new PartyLink(cfg, make_callbacks(host));
+    attach_udp_path(link);
     {
         std::lock_guard<std::mutex> lk(r.mu);
         r.link = link;
@@ -2873,6 +3133,70 @@ void rejoin_main() {
     }
     std::lock_guard<std::mutex> lk(r.mu);
     r.busy = false;
+}
+
+// ---- Steam P2P: host -> guest in place (the overlay's Join Game) -----------------------------
+
+void set_env_var(const char* name, const char* value) {
+#if defined(_WIN32)
+    _putenv_s(name, value);
+#else
+    setenv(name, value, 1);
+#endif
+}
+
+// Background thread: the host link goes (BYE), the game's calls move to a fresh RemoteGuest in
+// its solo mode (this process's own service until the friend's host answers), Steam stops
+// hosting and connects to the friend. Nothing here calls game code: the world stays loaded.
+void switch_link_to_guest(std::uint64_t steamid, LinkConfig cfg, std::string connect) {
+    Runtime& r = R();
+    PartyLink* old = nullptr;
+    std::vector<std::shared_ptr<Pump>> pumps;
+    {
+        std::lock_guard<std::mutex> lk(r.mu);
+        old = r.link;
+        r.link = nullptr;
+        for (auto& [k, p] : r.pumps) pumps.push_back(p);
+        r.pumps.clear();
+    }
+    for (auto& p : pumps) p->stop = true;
+    if (!pumps.empty()) bbnet::party::PartyHostService::instance().wake_all();
+    coop::PartyDirector::Get().SetLink(nullptr);
+    if (old) old->stop(true);
+    traversal::stop();
+    netroute::Stop();
+    bbnet::set_host(false);  // the relay/session layer is a guest from here on
+    // The game's session calls (context, room, heartbeat, ...) go to this process's own host
+    // service until the friend's host answers: a guest that left / was refused (leave_main).
+    auto rg = std::make_shared<bbnet::party::RemoteGuest>();
+    bbnet::party::set_transport(rg);
+    rg->set_solo(true);
+    set_env_var("BB_PARTY", "join");
+    set_env_var("BB_PARTY_HOST", "0");
+    // No crash rejoin from a host marker after the switch.
+    {
+        std::lock_guard<std::mutex> lk(r.mu);
+        if (!r.marker.empty()) {
+            std::error_code ec;
+            fs::remove(r.marker, ec);
+            r.marker.clear();
+        }
+    }
+    auto& net = bbnet::steam::SteamNet::instance();
+    if (!net.join_host(steamid)) {
+        plog("Steam P2P: cannot switch to a guest: %s", net.status().c_str());
+        set_error("Steam P2P: cannot join the friend: " + net.status());
+    } else {
+        net.learn_peer(steamid);
+        plog("Steam P2P: switched to guest of %llu (%s) in place; this world stays loaded",
+             static_cast<unsigned long long>(steamid), connect.c_str());
+        bridge::OnHostAddress("Steam P2P");
+        start_guest_steam(std::move(cfg));
+    }
+    {
+        std::lock_guard<std::mutex> lk(r.mu);
+        r.busy = false;
+    }
 }
 
 // Registered with the network library (bbnet_internal.h) at static initialization.
@@ -2939,6 +3263,129 @@ int runtime_rejoin() {
     return 2;
 }
 
+void runtime_steam_join_tick(const coop::GameSnapshot& s) {
+    Runtime& r = R();
+    if (!steam_mode()) return;
+
+    // Guest after the switch: the friend's link is up -> ask its game for the room and join it
+    // from where this player stands (B2's title descriptor path, no title screen).
+    bool armed;
+    {
+        std::lock_guard<std::mutex> lk(r.mu);
+        armed = r.steam_switch_armed_join;
+    }
+    if (armed) {
+        PartyLink* link = runtime_link();
+        if (link && link->state() == LinkState::Connected && coop::b2::RequestInWorldJoin()) {
+            std::lock_guard<std::mutex> lk(r.mu);
+            r.steam_switch_armed_join = false;
+        }
+        return;
+    }
+
+    bool pending, leave_asked;
+    std::uint64_t steamid = 0;
+    Clock::time_point left_at{};
+    {
+        std::lock_guard<std::mutex> lk(r.mu);
+        if (r.busy || r.st.role != RuntimeRole::Host) return;
+        pending = r.steam_switch_pending;
+        steamid = r.steam_switch_steamid;
+        leave_asked = r.steam_switch_leave;
+        left_at = r.steam_switch_left_at;
+    }
+    if (!pending) {
+        bbnet::steam::JoinRequest request;
+        if (!bbnet::steam::SteamNet::instance().pop_join_request(&request)) return;
+        if (!request.steamid) {
+            plog("Steam P2P: ignoring Join Game without a SteamID while hosting");
+            return;
+        }
+        PartyLink* link = runtime_link();
+        if (link && link->roster().size() > 1) {
+            plog("Steam P2P: Join Game from %llu ignored while guests are connected",
+                 static_cast<unsigned long long>(request.steamid));
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lk(r.mu);
+            r.steam_switch_pending = true;
+            r.steam_switch_steamid = request.steamid;
+            r.steam_switch_connect = request.connect;
+            r.steam_switch_leave = false;
+            r.steam_switch_left_at = Clock::time_point{};
+        }
+        plog("Steam P2P: Join Game from %llu (%s) while hosting; switching to guest in place once "
+             "this world is ready",
+             static_cast<unsigned long long>(request.steamid), request.connect.c_str());
+        bridge::OnNetwork("Steam P2P: joining the friend's party");
+        pending = true;
+        steamid = request.steamid;
+        leave_asked = false;
+    }
+    // The switch happens where the player stands: wait for the own world (no load under way).
+    if (!s.world_up || s.loading || !s.player) {
+        static Clock::time_point said{};
+        const auto now = Clock::now();
+        if (std::chrono::duration<double>(now - said).count() > 5.0) {
+            said = now;
+            plog("Steam P2P: the switch waits for this world (world %d, loading %d, player %d)",
+                 int(s.world_up), int(s.loading), int(s.player != 0));
+        }
+        return;
+    }
+    const bool in_session = s.session_role == coop::RoleHost || s.session_role == coop::RoleTryingToJoin ||
+                            s.session_role == coop::RoleClient;
+    if (!leave_asked) {
+        {
+            std::lock_guard<std::mutex> lk(r.mu);
+            r.steam_switch_leave = true;
+            r.steam_switch_left_at = Clock::now();
+        }
+        left_at = Clock::now();
+        if (in_session) {
+            if (!coop::LeaveGameSession()) {
+                plog("Steam P2P: cannot end this host's session (role %d); staying host", s.session_role);
+                std::lock_guard<std::mutex> lk(r.mu);
+                r.steam_switch_pending = false;
+                r.steam_switch_leave = false;
+                return;
+            }
+            plog("Steam P2P: ended this host's session (role %d); switching once it is idle", s.session_role);
+            bridge::OnNetwork("Steam P2P: ending this session to join the friend");
+            return;
+        }
+    }
+    // The game's leave is asynchronous: wait for the idle role (bounded, then switch anyway).
+    if (in_session) {
+        if (std::chrono::duration<double>(Clock::now() - left_at).count() < 5.0) return;
+        plog("Steam P2P: the session is still role %d after 5 s; switching anyway", s.session_role);
+    }
+
+    LinkConfig cfg;
+    std::string connect;
+    {
+        std::lock_guard<std::mutex> lk(r.mu);
+        r.busy = true;
+        cfg = r.cfg;
+        connect = r.steam_switch_connect;
+        r.steam_switch_pending = false;
+        r.steam_switch_leave = false;
+        r.st.role = RuntimeRole::Guest;
+        r.st.state = LinkState::Idle;
+        r.rpc_wired = false;
+        r.fresh_link = true;
+        r.left = false;
+        r.was_connected = false;
+        r.steam_switch_armed_join = true;
+    }
+    coop::PartyDirector::Get().SwitchRole(coop::PartyRole::Guest);
+    plog("Steam P2P: now a guest; the link switches to %llu", static_cast<unsigned long long>(steamid));
+    std::thread([steamid, cfg = std::move(cfg), connect = std::move(connect)]() mutable {
+        switch_link_to_guest(steamid, std::move(cfg), std::move(connect));
+    }).detach();
+}
+
 void runtime_shutdown() {
     Runtime& r = R();
     {
@@ -2949,7 +3396,7 @@ void runtime_shutdown() {
             std::error_code ec;
             fs::remove(r.marker, ec);
         }
-        if (!r.link && !r.upnp) {
+        if (!r.link && !r.upnp && !bbnet::steam::SteamNet::instance().running()) {
             r.stopping = true;
             return;
         }

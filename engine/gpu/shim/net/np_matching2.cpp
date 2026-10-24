@@ -783,6 +783,7 @@ BBNET_ABI int m2_context_start(unsigned ctx, unsigned) {
     });
     return 0;
 }
+
 BBNET_ABI int m2_context_stop(unsigned) {
     BBNET_GUEST_RETURN();
     {
@@ -1131,6 +1132,17 @@ BBNET_ABI int m2_unused(unsigned, const void*, const RequestOptParam*, unsigned*
 }
 
 }  // namespace
+
+// Public (party_runtime.cpp calls it): outside the unnamed namespace above so it has external
+// linkage; the state and the game's event handler stay internal to this file.
+void matching2_events_restart() {
+    bool started;
+    {
+        std::lock_guard<std::mutex> lk(g.mu);
+        started = g.started;
+    }
+    if (started) session::events_start(on_server_event);  // not under g.mu (it may stop a thread)
+}
 
 std::string npid_text(const void* npid) {
     if (!npid) return "";

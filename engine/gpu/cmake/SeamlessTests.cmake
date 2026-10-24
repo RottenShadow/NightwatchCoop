@@ -3,7 +3,7 @@ enable_testing()
 file(GLOB PARTY_NET_SOURCES CONFIGURE_DEPENDS shim/net/*.cpp)
 set(PARTY_LINK_SOURCES shim/party/party_link.cpp shim/party/party_rudp.cpp
     shim/party/party_code.cpp shim/party/party_addr.cpp shim/party/party_crypto.cpp
-    shim/party/party_lan.cpp shim/party/upnp_win.cpp)
+    shim/party/party_lan.cpp shim/party/upnp_win.cpp shim/net/steam_identity.cpp)
 add_executable(party-net-test EXCLUDE_FROM_ALL ../tests/test_party_net.cpp ${PARTY_NET_SOURCES})
 
 target_compile_options(party-net-test PRIVATE -UNDEBUG -Wall -Wextra)
@@ -406,7 +406,7 @@ set_target_properties(party-security-test PROPERTIES INTERPROCEDURAL_OPTIMIZATIO
 add_executable(party-gestures-test EXCLUDE_FROM_ALL ../tests/test_party_gestures.cpp shim/party/party_gestures.cpp
     shim/net/json.cpp)
 target_compile_definitions(party-gestures-test PRIVATE BB_PARTY_GESTURES_NO_GAME)
-target_compile_options(party-gestures-test PRIVATE -UNDEBUG -Wall -Wextra)
+target_compile_options(party-gestures-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
 target_include_directories(party-gestures-test PRIVATE shim)
 set_target_properties(party-gestures-test PROPERTIES INTERPROCEDURAL_OPTIMIZATION OFF)
 # Lifts in a party: the table and the decisions (party_lift_rules.h). ninja -C out/gpu party-lift-rules-test
@@ -446,6 +446,16 @@ target_compile_options(party-bossfog-rules-test PRIVATE -UNDEBUG -Wall -Wextra)
 target_include_directories(party-bossfog-rules-test PRIVATE shim)
 set_target_properties(party-bossfog-rules-test PROPERTIES INTERPROCEDURAL_OPTIMIZATION OFF)
 add_test(NAME boot-watch-test COMMAND boot-watch-test)
+
+# Steam mode without the SDK: the transport stub, the virtual address book and the
+# password/SteamID/AppID secret. BB_STEAM_STUB keeps every public declaration testable in CI.
+add_executable(party-steam-identity-test EXCLUDE_FROM_ALL ../tests/test_party_steam.cpp
+    shim/net/party_steam.cpp shim/net/steam_identity.cpp shim/party/party_crypto.cpp
+    third_party/monocypher/monocypher.c)
+target_compile_definitions(party-steam-identity-test PRIVATE BB_STEAM_STUB=1)
+target_compile_options(party-steam-identity-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+target_include_directories(party-steam-identity-test PRIVATE shim shim/net)
+set_target_properties(party-steam-identity-test PROPERTIES INTERPROCEDURAL_OPTIMIZATION OFF)
 get_property(all_targets DIRECTORY PROPERTY BUILDSYSTEM_TARGETS)
 set(party_tests)
 foreach(target IN LISTS all_targets)

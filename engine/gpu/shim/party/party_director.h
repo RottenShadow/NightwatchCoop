@@ -70,6 +70,9 @@ public:
     /// From the environment (BB_PARTY, BB_PARTY_MAX, BB_PARTY_RING_EVERY, BB_PARTY_DIRECTOR_TEST).
     void ConfigureFromEnv();
     void Configure(PartyRole role, int max_players);
+    /// Main thread: the role changes at runtime (Steam P2P host -> guest on Join Game): keeps
+    /// the party size, resets the host hull clock, tells the progress sync.
+    void SwitchRole(PartyRole role);
     /// The party's link (A3/A4 wiring); nullptr detaches. The link must outlive its attachment.
     void SetLink(party::PartyLink* link);
     PartyRole Role() const;

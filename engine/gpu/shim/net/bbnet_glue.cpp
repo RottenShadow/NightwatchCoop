@@ -65,6 +65,18 @@ Settings* load_settings() {
         s->host = lower == "host";
     }
     if (const char* h = env("BB_PARTY_HOST")) s->host = h[0] == '1';
+    const char* steam = env("BB_PARTY_STEAM");
+    const char* transport = env("BB_PARTY_TRANSPORT");
+    if ((steam && steam[0] != '0') || (transport && std::strcmp(transport, "steam") == 0)) {
+        s->steam = true;
+        s->party = true;
+    }
+    if (const char* appid = env("BB_STEAM_APPID")) {
+        char* end = nullptr;
+        const unsigned long v = std::strtoul(appid, &end, 10);
+        if (end && *end == '\0' && v > 0 && v <= 0xfffffffful) s->steam_appid = static_cast<std::uint32_t>(v);
+        else std::printf("Net: BB_STEAM_APPID '%s' is not an AppID; using %u\n", appid, s->steam_appid);
+    }
     if (const char* port = env("BB_PARTY_PORT")) {
         const long v = std::strtol(port, nullptr, 10);
         if (v > 0 && v < 65536) s->party_port = static_cast<std::uint16_t>(v);
@@ -86,8 +98,8 @@ Settings* load_settings() {
         } else {
             netsim::configure(sim);
         }
-        std::printf("[coop] Net: party networking on (%s, as %s, port %u)\n", s->host ? "host" : "guest", s->online_id.c_str(),
-                    s->party_port);
+        std::printf("[coop] Net: party networking on (%s, as %s, %s port %u)\n", s->host ? "host" : "guest",
+                    s->online_id.c_str(), s->steam ? "Steam P2P," : "", s->party_port);
     }
     return s;
 }
@@ -105,6 +117,12 @@ void set_dirs(const char* app0, const char* user_dir) {
     std::lock_guard<std::mutex> lk(g_settings_mu);
     if (app0) g_settings->app0 = app0;
     if (user_dir) g_settings->user_dir = user_dir;
+}
+
+void set_host(bool host) {
+    settings();
+    std::lock_guard<std::mutex> lk(g_settings_mu);
+    g_settings->host.store(host, std::memory_order_release);
 }
 
 namespace {

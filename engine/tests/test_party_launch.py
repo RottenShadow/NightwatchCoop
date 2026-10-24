@@ -15,6 +15,14 @@ class PartyLaunchTests(unittest.TestCase):
             self.assertEqual(env, {'BB_PARTY': 'join', 'BB_PARTY_AUTOCONTINUE': '1'})
             self.assertFalse(path.exists())
 
+    def test_steam_appid_survives_the_relaunch(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'party_relaunch.bat'
+            path.write_text('set "BB_PARTY=join"\nset "BB_STEAM_APPID=480"\n')
+            env = {'BB_PARTY': 'host', 'BB_STEAM_APPID': '480'}
+            self.assertTrue(apply_relaunch(path, env))
+            self.assertEqual(env, {'BB_PARTY': 'join', 'BB_STEAM_APPID': '480'})
+
     def test_rejects_whole_file_before_changing_environment(self):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / 'party_relaunch.bat'

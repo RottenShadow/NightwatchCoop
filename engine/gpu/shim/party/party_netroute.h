@@ -31,6 +31,7 @@ constexpr const char* kNet6TableEvent = "net6_table";  // host -> guests {Member
 constexpr const char* kRelayPunchEvent = "relay_punch";  // host -> guests {Addr, Port}
 constexpr const char* kRelayKeyEvent = "relay_key";      // member -> host {Id, Key}: its V / v frame key
 constexpr const char* kNet6EchoEvent = "net6_echo";      // guest -> host {Nonce}: the IPv6 nonce it got
+constexpr const char* kSteamPeersEvent = "steam_peers";  // host -> guests {Members:[{Id, Name}]}: authenticated SteamIDs
 
 struct Env {
     std::function<PartyLink*()> link;

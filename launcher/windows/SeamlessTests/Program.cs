@@ -44,6 +44,18 @@ static void Check(bool condition, string message)
     if (!condition) throw new InvalidOperationException(message);
 }
 
+Check(SteamAccount.PartyName("Rotten Shadow") == "Rotten_Shadow", "Steam spaces were not sanitized");
+Check(SteamAccount.PartyName("A!B C") == "AB_C", "Steam invalid characters were not dropped");
+Check(SteamAccount.PartyName("") == "Hunter", "Empty Steam persona did not fall back to Hunter");
+Check(SteamAccount.PartyName("Very Long Steam Name") == "Very_Long_Steam_", "Steam name was not capped at 16 characters");
+Check(System.Text.RegularExpressions.Regex.IsMatch(SteamAccount.PartyName("Very Long Steam Name"), "^[A-Za-z0-9_-]{1,16}$"),
+    "Steam persona produced an invalid engine name");
+Check(SteamAccount.Problem(new SteamAccount.Snapshot(0, "", "Steam is not running or no account is signed in.")).StartsWith("Steam is not open."),
+    "Steam preflight did not report a closed client");
+Check(SteamAccount.Problem(new SteamAccount.Snapshot(0, "", "steam_api64.dll is not installed next to the launcher.")).Contains("Steam P2P is unavailable"),
+    "Steam preflight hid a missing DLL");
+Check(SteamAccount.Problem(new SteamAccount.Snapshot(76561198000000000, "Hunter", "")) == "", "Available Steam account reported a problem");
+
 var settings = new LauncherSettings();
 settings.Set("party_mode", "host");
 settings.Set("party_name", "Host_Test");
@@ -106,6 +118,39 @@ Check(SeamlessSettings.Validate(settings) == null, "Valid join target rejected")
 settings.Set("party_port", "65536");
 Check(SeamlessSettings.Validate(settings) != null, "Invalid port accepted");
 settings.Set("party_port", "47890");
+settings.Set("party_transport", "steam");
+settings.Set("party_mode", "host");
+settings.PartyPassword = "";
+Check(SeamlessSettings.Validate(settings) != null, "Steam host accepted without a password");
+settings.PartyPassword = "steam secret";
+settings.Set("steam_appid", "480");
+settings.Set("party_name", "bad name");
+Check(SeamlessSettings.Validate(settings) == null, "Steam mode still validates the direct-only party name");
+var steamAccount = new SteamAccount.Snapshot(76561198000000000, "Rotten Shadow", "");
+var steamEnv = new Dictionary<string, string>();
+SeamlessSettings.Apply(settings, steamEnv, steamAccount);
+Check(steamEnv["BB_PARTY_STEAM"] == "1" && steamEnv["BB_STEAM_APPID"] == "480",
+    "Steam host environment missing");
+Check(steamEnv["BB_PARTY_NAME"] == "Rotten_Shadow", "Steam party name did not come from the Steam persona");
+Check(!steamEnv.ContainsKey("BB_PARTY_UPNP") && !steamEnv.ContainsKey("BB_PARTY_STUN"), "Direct network settings leaked into Steam mode");
+settings.Set("party_mode", "join");
+Check(SeamlessSettings.Validate(settings) == null, "Steam join rejected without a launcher host SteamID");
+var joinEnv = new Dictionary<string, string>();
+SeamlessSettings.Apply(settings, joinEnv, steamAccount);
+Check(joinEnv["BB_PARTY_PASSWORD"] == "steam secret",
+    "Steam join did not start in overlay-wait mode with the password");
+settings.Set("party_mode", "");
+Check(SeamlessSettings.Enabled(settings), "Steam transport without a mode is not enabled");
+var singleSteamEnv = new Dictionary<string, string>();
+SeamlessSettings.Apply(settings, singleSteamEnv, steamAccount);
+Check(singleSteamEnv["BB_PARTY"] == "host",
+    "Steam single mode did not start as host");
+settings.Set("steam_appid", "0");
+Check(SeamlessSettings.Validate(settings) != null, "Invalid Steam AppID accepted");
+settings.Set("steam_appid", "480");
+settings.Set("party_transport", "direct");
+settings.Set("party_mode", "host");
+settings.PartyPassword = "test secret";
 settings.Set("party_name", "bad name");
 Check(SeamlessSettings.Validate(settings) != null, "Invalid name accepted");
 settings.Set("party_mode", "");

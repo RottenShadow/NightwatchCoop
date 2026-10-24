@@ -6,6 +6,7 @@
 #include "party/party_netpath.h"
 #include "party/party_rudp.h"
 #include "party/party_traversal.h"
+#include "net/party_steam.h"
 #include "bbport_settings.h"
 #include "../net/bbnet_internal.h"
 #include "../net/json.h"
@@ -778,7 +779,7 @@ void GuestNetworkLine(const std::string& line) {
 
 bool OnEvent(bool host, int slot, const std::string& name, const std::string& body) {
     if (name != kNet6Event && name != kNet6TableEvent && name != kRelayPunchEvent && name != kRelayKeyEvent &&
-        name != kNet6EchoEvent)
+        name != kNet6EchoEvent && name != kSteamPeersEvent)
         return false;
     json::Value v;
     std::string err;
@@ -845,6 +846,29 @@ bool OnEvent(bool host, int slot, const std::string& name, const std::string& bo
             S().key_owner[slot] = member;
         }
         log("member relay: " + member + " may relay guests to us (its relay key, from its party link)");
+        return true;
+    }
+    if (!host && name == kSteamPeersEvent) {
+        // The host vouched for these SteamIDs over our authenticated link: map each to its virtual
+        // address and allow its game traffic (a guest-to-guest Steam connection needs both sides).
+        const json::Value* members = v.find("Members");
+        if (!members || members->type != json::Value::Type::Array) return true;
+        auto& net = bbnet::steam::SteamNet::instance();
+        const std::uint64_t own = net.local_steamid();
+        std::vector<std::uint64_t> trusted;
+        int n = 0;
+        for (const json::Value& e : members->array) {
+            if (++n > static_cast<int>(kMaxRosterEntries) + 1) break;
+            const std::string text = str_of(e, "Id");
+            char* end = nullptr;
+            const unsigned long long id = std::strtoull(text.c_str(), &end, 10);
+            if (!end || *end != '\0' || !id || id == own) continue;
+            const std::uint64_t steamid = static_cast<std::uint64_t>(id);
+            if (!net.learn_peer(steamid)) continue;
+            trusted.push_back(steamid);
+        }
+        if (!trusted.empty()) net.set_trusted_peers(trusted);
+        for (const std::uint64_t id : trusted) net.connect_peer(id);
         return true;
     }
     if (!host && name == kNet6TableEvent) {

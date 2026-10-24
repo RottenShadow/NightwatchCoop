@@ -102,10 +102,23 @@ while ($queue.Count) {
 foreach ($folder in 'patches', 'data') {
     Copy-Item -Path (Join-Path $engine "$folder\*") -Destination (Join-Path $destinationRoot "engine\$folder") -Recurse -Force
 }
+# Steam P2P: the SDK's redistributable DLL beside both the engine and the launcher, and the
+# default AppID in the engine's working directory (the launcher rewrites it for a custom AppID).
+$steamSdk = Join-Path $engine 'gpu\third_party\steamworks'
+if (Test-Path -LiteralPath (Join-Path $steamSdk 'redistributable_bin\win64\steam_api64.dll')) {
+    Copy-Item -LiteralPath (Join-Path $steamSdk 'redistributable_bin\win64\steam_api64.dll') -Destination $destinationRoot -Force
+    Copy-Item -LiteralPath (Join-Path $steamSdk 'redistributable_bin\win64\steam_api64.dll') -Destination $out -Force
+    Set-Content -LiteralPath (Join-Path $destinationRoot 'engine\steam_appid.txt') -Encoding ascii -Value '480'
+} else {
+    Write-Warning 'Steamworks SDK redistributable is missing: the package has no Steam P2P mode.'
+}
 $licenses = Join-Path $destinationRoot 'engine\licenses'
 New-Item -ItemType Directory -Force -Path (Join-Path $licenses 'msys2') | Out-Null
 Copy-Item -Path (Join-Path $MsysRoot 'clang64\share\licenses\*') -Destination (Join-Path $licenses 'msys2') -Recurse -Force
 Copy-Item -LiteralPath (Join-Path $engine 'gpu\third_party\monocypher\LICENCE.md') -Destination (Join-Path $licenses 'Monocypher.md') -Force
+if (Test-Path -LiteralPath (Join-Path $steamSdk 'Readme.txt')) {
+    Copy-Item -LiteralPath (Join-Path $steamSdk 'Readme.txt') -Destination (Join-Path $licenses 'Steamworks.txt') -Force
+}
 
 # 3. The party save tools and an embedded Python (python.org, signature checked) in seamless\.
 $seamless = Join-Path $destinationRoot 'seamless'

@@ -4,6 +4,7 @@
 // session layer uses (STUN, relay, hole punching) and the guest-callback dispatcher.
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -42,14 +43,21 @@ struct GuestReturn {
 
 struct Settings {
     bool party = false;          // BB_PARTY set (non-empty)
-    bool host = false;           // BB_PARTY=host (or BB_PARTY_HOST=1): answers relay HELLOs
+    // BB_PARTY=host (or BB_PARTY_HOST=1): answers relay HELLOs. Atomic: a Steam host switches
+    // to guest at runtime (Steam overlay Join Game) while the network library reads it.
+    std::atomic<bool> host{false};
     std::string party_value;     // BB_PARTY as given
     std::uint16_t party_port = 9307;  // BB_PARTY_PORT: the UDP port the game's P2P port 3658 maps to
     std::string online_id;       // BB_PARTY_NAME (validated) else BB_USER_NAME, at most 16 characters
     bool np_state_callback = true;  // BB_NP_STATE_CB=0: sceNpCheckCallback fires nothing
+    bool steam = false;          // BB_PARTY_STEAM=1: Steam P2P instead of party codes / VPN
+    std::uint32_t steam_appid = 480;       // BB_STEAM_APPID (Spacewar by default)
     std::string app0, user_dir;  // from bbnet_configure
 };
 const Settings& settings();
+// Steam P2P host -> guest at runtime: what the relay/session layer reads (settings().host) and
+// what the guest code paths check, changed under the settings lock.
+void set_host(bool host);
 void set_dirs(const char* app0, const char* user_dir);
 
 void log(const char* fmt, ...) __attribute__((format(gnu_printf, 1, 2)));

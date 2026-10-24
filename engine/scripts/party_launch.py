@@ -21,7 +21,7 @@ def apply_relaunch(path, env):
         if not match:
             raise ValueError('Invalid party relaunch settings; no commands were executed')
         key, value = match.groups()
-        if not key.startswith(('BB_PARTY', 'BB_SKIP_NETWORK', 'BB_SAVE_', 'BB_AUTO_CONTINUE')):
+        if not key.startswith(('BB_PARTY', 'BB_SKIP_NETWORK', 'BB_SAVE_', 'BB_AUTO_CONTINUE', 'BB_STEAM_')):
             raise ValueError(f'Unexpected party relaunch setting: {key}')
         updates[key] = value
     for key, value in updates.items():

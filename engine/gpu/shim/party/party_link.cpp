@@ -5,6 +5,7 @@
 #include "party_sock.h"
 #include "party_rudp.h"
 #include "../net/netsim.h"
+#include "../net/steam_identity.h"
 
 #include <algorithm>
 #include <cctype>
@@ -1036,18 +1037,21 @@ struct PartyLink::Impl {
         const auto heard = ext_heard.find(ep_key(ep));
         const double heard_s = heard == ext_heard.end() ? -1.0 : ms_between(heard->second, Clock::now()) / 1000.0;
         std::string via;
+        const bool steam_peer = bbnet::steam::is_synthetic_nbo(ep.addr);
         const int routed = route_hint ? route_hint(ep.addr, ep.port) : 0;
         if (uext) {
             if (routed) {
                 own_peers.erase(ep_key(ep));
                 via = "; from the party port (its route table reaches the host another way)";
-            } else if (udp_fallback_socket(true, heard_s) == UdpFallbackSocket::Ephemeral && open_udp_socket(0, true)) {
+            } else if (!steam_peer && udp_fallback_socket(true, heard_s) == UdpFallbackSocket::Ephemeral &&
+                       open_udp_socket(0, true)) {
                 if (own_peers.insert(ep_key(ep)).second)
                     via = "; from a separate UDP port " + std::to_string(uport) +
                           " until the host is heard on the party port (blind datagrams from the party port can "
                           "block that port's path to the host)";
             } else {
                 if (own_peers.erase(ep_key(ep))) via = "; from the party port (the host was heard on it)";
+                if (steam_peer) via = "; over Steam P2P";
             }
         }
         if (c->s != sock::kInvalid) {
@@ -1057,12 +1061,18 @@ struct PartyLink::Impl {
         c->us = umux.connect(ep, Clock::now(), cfg.connect_timeout_ms);
         c->created = c->last_rx = Clock::now();
         const double gone = since_host_gone_s();
-        log(std::string("party link: ") + why + "; connecting over UDP (hole punching; " +
-            (gone >= 0 && gone < kHostBackWaitS ? host_no_answer_hint(gone)
-             : cfg.auto_punch ? std::string("the DHT announces us for a host behind a NAT; else give it your guest code")
-                              : std::string("give the host your guest code if it is behind a NAT, or turn on the DHT "
-                                            "option on both PCs")) +
-            ")" + via);
+        const std::string how =
+            steam_peer ? "connecting over Steam P2P"
+                       : "connecting over UDP (hole punching; " +
+                             (gone >= 0 && gone < kHostBackWaitS
+                                  ? host_no_answer_hint(gone)
+                                  : cfg.auto_punch
+                                        ? std::string("the DHT announces us for a host behind a NAT; else give it "
+                                                      "your guest code")
+                                        : std::string("give the host your guest code if it is behind a NAT, or turn "
+                                                      "on the DHT option on both PCs")) +
+                             ")";
+        log(std::string("party link: ") + why + "; " + how + via);
         return true;
     }
     // Every pass (mu held): datagrams in, accepted streams, stream <-> connection bytes, datagrams out.
@@ -2232,8 +2242,36 @@ struct PartyLink::Impl {
         }
     }
 
+    // Guest: a fresh rUDP attempt to the host's Steam synthetic address. That address has no TCP
+    // listener behind it, so a reconnect must not dial (the old code dialed on every cycle).
+    void start_steam_connect() {  // mu held
+        want_connect = false;
+        auto c = std::make_unique<Conn>();
+        c->id = next_conn_id++;
+        c->created = c->last_rx = Clock::now();
+        c->phase = Phase::Connecting;
+        Conn* raw = c.get();
+        conns.push_back(std::move(c));
+        gconn = raw;
+        set_state(LinkState::Connecting, host_name + ":" + std::to_string(host_port));
+        in_addr lit{};
+        if (inet_pton(AF_INET, host_name.c_str(), &lit) != 1) {
+            lose(raw, "cannot parse the Steam host address " + host_name);
+            return;
+        }
+        std::memcpy(raw->peer_ip.data(), &lit, 4);
+        raw->peer_port = host_port;
+        if (cfg.udp_link && !uext) open_udp_socket(0);
+        if (!switch_to_udp(raw, "Steam mode: no TCP to the synthetic address"))
+            lose(raw, "cannot open the Steam P2P UDP path");
+    }
+
     // A due reconnect: dials (resolve, socket, connect) without mu, then installs it (mu held).
     void connect_unlocked(std::unique_lock<std::mutex>& lk) {
+        if (cfg.steam_link) {
+            start_steam_connect();
+            return;
+        }
         const std::string name = host_name;
         const std::uint16_t port = host_port;
         lk.unlock();
@@ -2363,6 +2401,23 @@ bool PartyLink::start_guest(const std::string& host, std::uint16_t port, std::st
     if (!valid_member_name(I.cfg.name)) return fail("invalid name (1-16 of A-Z a-z 0-9 _ -)");
     I.host = false;
     I.party_key = crypto::derive_party_key(I.cfg.password, I.cfg.secret.data());
+    if (I.cfg.steam_link) {
+        // The host address is a synthetic 198.18/15 Steam address with no TCP listener behind
+        // it: dialing it can never succeed. Go straight to the rUDP path carried by Steam P2P.
+        in_addr lit{};
+        if (inet_pton(AF_INET, host.c_str(), &lit) != 1) return fail("cannot parse Steam virtual address: " + host);
+        {
+            std::lock_guard<std::mutex> lk(I.mu);
+            if (I.cfg.udp_link && !I.uext) I.open_udp_socket(0);
+            I.host_name = host;
+            I.host_port = port;
+            I.start_time = Clock::now();
+            I.start_steam_connect();
+            I.publish();
+        }
+        I.start_threads();
+        return true;
+    }
     Impl::Dial d = Impl::dial(host, port);
     {
         std::lock_guard<std::mutex> lk(I.mu);

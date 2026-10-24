@@ -19,6 +19,8 @@
 #include "nr_outage.h"
 #include "party_route.h"
 #include "party_udp.h"
+#include "steam_identity.h"
+#include "party_steam.h"
 
 #if defined(_WIN32)
 #include <winsock2.h>
@@ -222,6 +224,9 @@ ssize_type raw_recvfrom(sockfd_t fd, void* buf, std::size_t len, int flags, sock
 }
 // Every UDP datagram leaves here: through the network simulator when BB_NET_SIM is on.
 ssize_type raw_sendto(sockfd_t fd, const void* buf, std::size_t len, const sockaddr_in* sa) {
+    // Virtual Steam peers never go to the kernel: port_send() carries their datagrams over the
+    // Steam connection. Reaching here means a legacy route tried to put one on the wire.
+    if (steam::SteamNet::instance().running() && steam::is_synthetic_nbo(sa->sin_addr.s_addr)) return -1;
     if (netsim::enabled() && netsim::config().nat) netsim::nat_note_out(sa->sin_addr.s_addr, sa->sin_port);
     if (netsim::enabled() && netsim::applies_to(netsim::config(), sa->sin_addr.s_addr)) {
         return netsim::sendto(static_cast<std::uintptr_t>(fd), buf, len, sa->sin_addr.s_addr, sa->sin_port);
@@ -479,6 +484,19 @@ ssize_type wire_send(P2pPort& port, const udp::Wire& w) {
 // know it, through the route table (IPv6, a member relay) onto the wire. A datagram the route
 // cannot carry yet (a relay handshake, an IPv6 key without IPv6) counts as sent and lost.
 ssize_type port_send(P2pPort& port, const void* buf, std::size_t len, const sockaddr_in* sa) {
+    // Steam P2P: a virtual 198.18/15 destination is a party member. The payload already carries
+    // the P2P header (or the link's 0xfa 'L' frame), so the peer's reader below sees exactly
+    // what a LAN datagram would have carried. Link frames are allowed before PartyLink auth;
+    // game traffic waits for it.
+    auto& steam_net = steam::SteamNet::instance();
+    if (steam_net.running() && steam::is_synthetic_nbo(sa->sin_addr.s_addr)) {
+        std::uint64_t id = 0;
+        if (!steam_net.steamid_for_virtual(sa->sin_addr.s_addr, &id)) return -1;
+        const auto* d = static_cast<const std::uint8_t*>(buf);
+        const bool link_frame = len >= 2 && d[0] == 0xfa && d[1] == 'L';
+        if (!link_frame && !steam_net.is_trusted(id)) return -1;
+        return steam_net.send(id, buf, len) ? static_cast<ssize_type>(len) : -1;
+    }
     std::vector<udp::Wire> out;
     router().outgoing(sa->sin_addr.s_addr, sa->sin_port, static_cast<const std::uint8_t*>(buf), len, Clock::now(),
                       &out);
@@ -623,6 +641,70 @@ void relay_forward(P2pPort& port, std::uint8_t* buf, std::size_t n, const sockad
     ++port.relayed;
 }
 
+// A datagram delivered by the Steam transport: the virtual address stands in for the peer's
+// SteamID, and the port is the party port every peer uses. Link frames reach PartyLink before
+// authentication (they carry the AUTH exchange); game frames wait until it succeeds.
+void steam_deliver(P2pPort& port, steam::Datagram&& sd) {
+    auto& net = steam::SteamNet::instance();
+    std::uint32_t addr = 0;
+    if (!net.virtual_for_steamid(sd.steamid, &addr)) {
+        if (!net.learn_peer(sd.steamid) || !net.virtual_for_steamid(sd.steamid, &addr)) return;
+    }
+    const std::uint16_t port_nbo = bswap16(steam::kVirtualPort);
+    if (sd.bytes.size() >= 16 && sd.bytes[0] == 0xfa && sd.bytes[1] == 'L') {
+        std::function<void(std::uint32_t, std::uint16_t, const std::uint8_t*, std::size_t)> h;
+        {
+            std::lock_guard<std::mutex> lk(g_link_handler_mu);
+            h = g_link_handler;
+        }
+        if (h) h(addr, port_nbo, sd.bytes.data(), sd.bytes.size());
+        return;
+    }
+    if (!net.is_trusted(sd.steamid)) return;
+    std::uint16_t src = 0, dst = 0;
+    const std::size_t hdr = p2p_header(sd.bytes.data(), sd.bytes.size(), &src, &dst);
+    if (!hdr) return;
+    std::shared_ptr<SockQueue> q;
+    bool forwarded = false;
+    {
+        std::lock_guard<std::mutex> lk(port.mu);
+        ++port.rx;
+        note_heard_locked(port, source_key(addr, port_nbo));
+        auto it = port.by_vport.find(dst);
+        if (it != port.by_vport.end()) {
+            q = it->second;
+        } else if (!port.by_vport.empty()) {
+            q = port.by_vport.begin()->second;
+            forwarded = true;
+            ++port.unmatched;
+        }
+    }
+    if (!q) return;
+    Datagram dg;
+    dg.data.assign(sd.bytes.begin() + static_cast<std::ptrdiff_t>(hdr), sd.bytes.end());
+    dg.addr = addr;
+    dg.port = port_nbo;
+    dg.vport = src;
+    if (PacketTraceFn tf = g_packet_trace.load(std::memory_order_relaxed))
+        tf(false, src, dst, dg.data.data(), dg.data.size());
+    hex_trace(false, src, dst, dg.data.data(), dg.data.size());
+    {
+        std::lock_guard<std::mutex> lk(q->mu);
+        ++q->in_dgrams;
+        q->in_bytes += dg.data.size();
+        q->heard[source_key(dg.addr, dg.port)] = Clock::now();
+        if (forwarded) ++q->forwarded;
+        if (q->q.size() >= kMaxInbox) {
+            q->q.pop_front();
+            port.dropped.fetch_add(1);
+        }
+        q->q.push_back(std::move(dg));
+        if (q->q.size() > q->hiwater) q->hiwater = q->q.size();
+    }
+    q->cv.notify_all();
+    net_wake();
+}
+
 // Waits for a datagram on the IPv4 socket or the IPv6 one (kBadSock: none); *r4 / *r6 say which.
 int poll2(sockfd_t fd, sockfd_t fd6, int ms, bool* r4, bool* r6) {
     *r4 = *r6 = false;
@@ -649,6 +731,11 @@ void p2p_reader(std::shared_ptr<P2pPort> port) {
     std::vector<udp::Wire> rout;
     std::vector<std::uint8_t> inner;
     while (!port->stop.load(std::memory_order_relaxed)) {
+        for (;;) {
+            steam::Datagram sd;
+            if (!steam::SteamNet::instance().pop_datagram(&sd)) break;
+            steam_deliver(*port, std::move(sd));
+        }
         if (settings().host && Clock::now() - last_expire > std::chrono::seconds(60)) {
             last_expire = Clock::now();
             g_relay_server.expire(last_expire);
@@ -686,7 +773,9 @@ void p2p_reader(std::shared_ptr<P2pPort> port) {
         }
         bool r4 = false, r6 = false;
         const sockfd_t fd6 = port->fd6.load();
-        if (poll2(port->fd, fd6, 200, &r4, &r6) <= 0) continue;
+        // Steam has no socket to wake this poll: check its queue often while it is running.
+        const int wait_ms = steam::SteamNet::instance().running() ? 5 : 200;
+        if (poll2(port->fd, fd6, wait_ms, &r4, &r6) <= 0) continue;
         sockaddr_in sa{};
         udp::Wire from;
         ssize_type n = -1;

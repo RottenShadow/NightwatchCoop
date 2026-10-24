@@ -1669,6 +1669,74 @@ static void test_udp_fallback_socket() {
     g.stop(false);
 }
 
+// The Steam guest path must never dial: a synthetic host address has no TCP listener behind it.
+// A loopback listener stands in for that listener. With `steam_link`, start_guest goes straight
+// to the rUDP path, so the listener sees no connection.
+static void test_steam_link_skips_tcp() {
+    sock::startup();
+    sock::Socket ls = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    sockaddr_in a{};
+    a.sin_family = AF_INET;
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    CHECK(::bind(ls, reinterpret_cast<sockaddr*>(&a), sizeof a) == 0 && ::listen(ls, 4) == 0);
+    sock::socklen al = sizeof a;
+    getsockname(ls, reinterpret_cast<sockaddr*>(&a), &al);
+    const std::uint16_t port = ntohs(a.sin_port);
+    LinkConfig c = base_cfg("Steam_Link", "steam password");
+    c.steam_link = true;
+    c.udp_link = true;
+    c.tcp_fallback_ms = 0;
+    c.connect_timeout_ms = 5000;
+    PartyLink g(c, LinkCallbacks{});
+    std::string err;
+    CHECK(g.start_guest("127.0.0.1", port, &err));
+    CHECK(g.state() == LinkState::Connecting);
+    CHECK(wait_for([&] { return g.udp_local_port() != 0; }, 3000));
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    sock::PollFd p{};
+    p.fd = ls;
+    p.events = POLLIN;
+    CHECK(sock::poll(&p, 1, 0) == 0);  // no TCP connection was attempted
+    g.stop(false);
+    sock::close(ls);
+}
+
+// A Steam reconnect must also skip TCP: the first rUDP attempt times out, the link backs off and
+// starts the rUDP path again. The old reconnect dialed the synthetic host address every cycle.
+static void test_steam_reconnect_skips_tcp() {
+    sock::startup();
+    sock::Socket ls = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    sockaddr_in a{};
+    a.sin_family = AF_INET;
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    CHECK(::bind(ls, reinterpret_cast<sockaddr*>(&a), sizeof a) == 0 && ::listen(ls, 4) == 0);
+    sock::socklen al = sizeof a;
+    getsockname(ls, reinterpret_cast<sockaddr*>(&a), &al);
+    const std::uint16_t port = ntohs(a.sin_port);
+    LinkConfig c = base_cfg("Steam_Retry", "steam password");
+    c.steam_link = true;
+    c.udp_link = true;
+    c.tcp_fallback_ms = 0;
+    c.connect_timeout_ms = 200;
+    c.lost_timeout_ms = 200;
+    c.backoff_initial_ms = 50;
+    c.backoff_max_ms = 100;
+    c.backoff_jitter_pct = 0;
+    PartyLink g(c, LinkCallbacks{});
+    std::string err;
+    CHECK(g.start_guest("127.0.0.1", port, &err));
+    CHECK(wait_for([&] { return g.state() == LinkState::Reconnecting; }, 3000));
+    CHECK(wait_for([&] { return g.state() == LinkState::Connecting; }, 3000));
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    sock::PollFd p{};
+    p.fd = ls;
+    p.events = POLLIN;
+    CHECK(sock::poll(&p, 1, 0) == 0);  // no TCP connection on the reconnect either
+    CHECK(g.state() == LinkState::Connecting || g.state() == LinkState::Reconnecting);
+    g.stop(false);
+    sock::close(ls);
+}
+
 int main() {
     // Loopback-only sockets: no Windows Firewall prompt for a test program (party_sock.h).
     if (!std::getenv("BB_PARTY_LOOPBACK")) {
@@ -1698,6 +1766,10 @@ int main() {
     test_new_code_live();
     std::printf("UDP fallback socket\n");
     test_udp_fallback_socket();
+    std::printf("Steam link: no TCP to the synthetic host address\n");
+    test_steam_link_skips_tcp();
+    std::printf("Steam link: a reconnect does not dial TCP\n");
+    test_steam_reconnect_skips_tcp();
     std::printf("max players 2, secret-only key\n");
     test_max_players_two();
     test_plain_address_password();

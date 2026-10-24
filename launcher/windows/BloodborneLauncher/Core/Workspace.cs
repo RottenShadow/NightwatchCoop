@@ -267,7 +267,7 @@ namespace BloodborneLauncher.Core
             });
         }
 
-        public string? StartGame()
+        public string? StartGame(SteamAccount.Snapshot? steam = null)
         {
             SaveNow();
             OutputLines.Clear();
@@ -294,7 +294,7 @@ namespace BloodborneLauncher.Core
             var safeMode = Settings.Bool("safe_mode_next");
             Session = new SessionStats();
             _hdrBefore = WindowsHdr.Displays();
-            var error = Game.Start(Settings);
+            var error = Game.Start(Settings, steam);
             if (error != null)
             {
                 Log(error, LogLevel.Bad);

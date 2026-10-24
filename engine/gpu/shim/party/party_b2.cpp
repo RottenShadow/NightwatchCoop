@@ -9292,12 +9292,28 @@ struct TitleJoin {
     u32 stage = 0;
     float pos[4] = {}, rot[4] = {};
     int last_role = -2, last_state = -2;
+    // A Steam switch joined from a loaded world (it keeps its own world and save spot): the
+    // title-only steps (forced placement, the return spot, going home by lamp) do not apply.
+    bool in_world = false;
     std::vector<int> requests;  // host: slots that asked
     std::map<int, std::uint64_t> channels;  // host: the dungeon each asking slot's own save holds (0: none / unknown)
 };
 TitleJoin& TJ() {
     static TitleJoin t;
     return t;
+}
+
+// Steam P2P: the host switched to guest in place and joins the friend's world from where it
+// stands (the title-join descriptor path without the title phases).
+struct InWorldJoinState {
+    std::mutex mu;
+    int state = 0;  // 0 none, 1 asked (waiting for the room), 2 joined, 3 failed
+    double start = 0;  // the first request (the 40 s deadline)
+    double since = 0;  // the last request (a retry every 3 s)
+};
+InWorldJoinState& IWJ() {
+    static InWorldJoinState j;
+    return j;
 }
 
 bool TitleJoinOn() {
@@ -10250,17 +10266,10 @@ void TitleJoinFail(const char* why) {
         Field<int>(Slot(kSlotFlow), 0x84, -1));
 }
 
-bool TitleJoinStart() {
-    TitleJoin& t = TJ();
-    std::vector<u8> room;
-    {
-        std::lock_guard<std::mutex> lk(t.mu);
-        room = t.room;
-    }
-    if (room.size() <= 8) {
-        TitleJoinFail("the host sent no room");
-        return false;
-    }
+// The host's serialized session descriptor -> this game's session: 0 no descriptor, 1 did not
+// parse, 2 JoinSession refused, 3 joined. Used at the title and from a world (Steam switch).
+int JoinWithDescriptor(const std::vector<u8>& room, const char* what) {
+    if (room.size() <= 8) return 0;
     using Ctor = void(BB_COOP_SYSV*)(u64);
     using Read = u8(BB_COOP_SYSV*)(u64, u64);
     using Join = u8(BB_COOP_SYSV*)(u64, u64);
@@ -10283,7 +10292,7 @@ bool TitleJoinStart() {
         const u8 slot = u8(h1);
         SafeWrite(gsm + 0x16f0, &h0, 4);
         SafeWrite(gsm + 0x16f4, &slot, 1);
-        g_rejoin = true;  // K5 / K6 quiet: no Lua join start at the title
+        g_rejoin = true;  // K5 / K6 quiet: no Lua join start (none at the title, bypassed here)
         // 0x1789010 without its Lua part (SprjLuaEventMan does not exist at the title: its
         // singleton check panics): the join 0x1ED0670 and the reset of the host-world blobs.
         joined = reinterpret_cast<Join>(Guest(0x1ed0670))(Slot(kSlotSession), u64(obj)) & 1;
@@ -10293,15 +10302,30 @@ bool TitleJoinStart() {
                 SafeWrite(gsm + off, &zero, 4);
             }
         }
-        Log("title join: descriptor read (%zu bytes, head %08x %08x); JoinSession -> %d (role %d)", room.size(), h0, h1,
+        Log("%s: descriptor read (%zu bytes, head %08x %08x); JoinSession -> %d (role %d)", what, room.size(), h0, h1,
             int(joined), Role());
     }
     reinterpret_cast<Ctor>(Guest(kRoomDtor))(u64(obj));
-    if (!read) {
+    return !read ? 1 : joined ? 3 : 2;
+}
+
+bool TitleJoinStart() {
+    TitleJoin& t = TJ();
+    std::vector<u8> room;
+    {
+        std::lock_guard<std::mutex> lk(t.mu);
+        room = t.room;
+    }
+    const int r = JoinWithDescriptor(room, "title join");
+    if (r == 0) {
+        TitleJoinFail("the host sent no room");
+        return false;
+    }
+    if (r == 1) {
         TitleJoinFail("the descriptor did not parse");
         return false;
     }
-    if (!joined) {
+    if (r == 2) {
         TitleJoinFail("JoinSession refused");
         return false;
     }
@@ -10309,6 +10333,106 @@ bool TitleJoinStart() {
     t.phase = TitlePhase::Joining;
     t.since = Now();
     return true;
+}
+
+// Guest: the title-join room request (also used by the in-world join's retries).
+void SendRoomRequest() {
+    const chalice::State cs = chalice::Read();
+    const std::uint64_t own = cs.valid && cs.load_mode == 0 ? cs.channel : chalice::LocalChannel();
+    char req[96];
+    std::snprintf(req, sizeof req, "{\"op\":\"title_req\",\"chalice\":\"%llx\"}", ull(own));
+    Send(0, req);
+}
+
+} // namespace
+
+// Public (the runtime calls it from another translation unit): not in the unnamed namespace above.
+bool RequestInWorldJoin() {
+    if (!TitleJoinOn() || !g_on.load()) return false;
+    {
+        std::lock_guard<std::mutex> lk(IWJ().mu);
+        if (IWJ().state != 0) return true;  // already asked / joined / gave up: the runtime disarms
+        IWJ().state = 1;
+        IWJ().start = IWJ().since = Now();
+    }
+    {
+        std::lock_guard<std::mutex> lk(TJ().mu);
+        TJ().have_reply = false;
+        TJ().room.clear();
+        TJ().acked = false;
+        TJ().in_world = true;
+    }
+    SendRoomRequest();
+    Log("in-world join: asking the new host for its room");
+    return true;
+}
+
+namespace {
+
+void InWorldJoinTick(const GameSnapshot& s, double now) {
+    int state;
+    double start, since;
+    {
+        std::lock_guard<std::mutex> lk(IWJ().mu);
+        state = IWJ().state;
+        start = IWJ().start;
+        since = IWJ().since;
+    }
+    if (state != 1) return;
+    // Join only from a steady world: the switch's own session leave may still be loading.
+    if (!s.world_up || s.loading) return;
+    std::vector<u8> room;
+    bool have;
+    {
+        std::lock_guard<std::mutex> lk(TJ().mu);
+        have = TJ().have_reply;
+        room = TJ().room;
+    }
+    if (have) {
+        const int r = JoinWithDescriptor(room, "in-world join");
+        if (r == 3) {
+            {
+                std::lock_guard<std::mutex> lk(IWJ().mu);
+                IWJ().state = 2;
+            }
+            // The post-arrival handling is the title join's (GameData as a summoned guest, the
+            // own return spot), keyed off its phase: start it at Loading (the Ready / forced
+            // placement steps are a title load's and do not apply here).
+            std::lock_guard<std::mutex> lk(TJ().mu);
+            TJ().phase = TitlePhase::Loading;
+            TJ().since = now;
+            Log("in-world join: joined the host's session from this world");
+            return;
+        }
+        // Refused (the host is busy / in another dungeon) or a descriptor that did not parse:
+        // clear it and ask again.
+        {
+            std::lock_guard<std::mutex> lk(TJ().mu);
+            TJ().have_reply = false;
+            TJ().room.clear();
+        }
+        {
+            std::lock_guard<std::mutex> lk(IWJ().mu);
+            IWJ().since = now;
+        }
+        Log("in-world join: the host's room was not usable (%d); asking again in 3 s", r);
+        return;
+    }
+    if (now - start > 40.0) {
+        std::lock_guard<std::mutex> lk(IWJ().mu);
+        IWJ().state = 3;
+        Log("in-world join: no room from the new host within 40 s; the party link stays up");
+        return;
+    }
+    // The host may still be warming up (its start flags): ask again every 3 s.
+    if (now - since >= 3.0) {
+        {
+            std::lock_guard<std::mutex> lk(IWJ().mu);
+            IWJ().since = now;
+        }
+        SendRoomRequest();
+        Log("in-world join: no room yet; asking the host again");
+    }
 }
 
 /// The flow update at the title (nothing else runs it there): only while the game's own does not
@@ -10377,10 +10501,12 @@ void TitleBesideTick(const GameSnapshot& s, double now) {
 void TitleJoinGuestTick(const GameSnapshot& s, double now) {
     TitleJoin& t = TJ();
     TitlePhase phase;
+    bool in_world;
     TitleBesideTick(s, now);
     {
         std::lock_guard<std::mutex> lk(t.mu);
         phase = t.phase;
+        in_world = t.in_world;
     }
     // The session type of a co-op summon (7: net chr type 1, a white phantom), which the summon load
     // passes and Continue's does not. Written only once the host's chr stands here (the first sync
@@ -10393,8 +10519,8 @@ void TitleJoinGuestTick(const GameSnapshot& s, double now) {
     // with the return spot written below).
     static bool sent_home = false;
     static double ended_at = 0;
-    const bool stranded = phase == TitlePhase::Done && !sent_home && s.world_up && !s.loading && Role() != RoleClient &&
-                          Role() != 4 && Field<u8>(Slot(kSlotGsm), 0x1592) == 0;
+    const bool stranded = phase == TitlePhase::Done && !in_world && !sent_home && s.world_up && !s.loading &&
+                          Role() != RoleClient && Role() != 4 && Field<u8>(Slot(kSlotGsm), 0x1592) == 0;
     if (!stranded) {
         ended_at = 0;
     } else if (ended_at == 0) {
@@ -10446,7 +10572,7 @@ void TitleJoinGuestTick(const GameSnapshot& s, double now) {
         }
     }
     static bool typed = false;
-    if (phase == TitlePhase::Done && !typed && s.world_up && !s.loading && Role() == RoleClient) {
+    if (phase == TitlePhase::Done && !in_world && !typed && s.world_up && !s.loading && Role() == RoleClient) {
         bool host_chr = false;
         for (const TaskInfo& k : Tasks(false)) {
             host_chr = host_chr || (k.mode == 2 && PlayerForPeer(k.task + kTaskPeer) && k.step == kStepUpdate);
@@ -10613,6 +10739,17 @@ void TitleJoinGuestTick(const GameSnapshot& s, double now) {
     }
     if (phase == TitlePhase::Loading && s.world_up && !s.loading) {
         g_rejoin = false;
+        if (in_world) {
+            // The Steam switch's join is in: this guest keeps its own world (no title load, no
+            // forced placement, no own-lamp return spot).
+            std::lock_guard<std::mutex> lk(t.mu);
+            t.done_load = now - t.since;
+            t.since = now;
+            t.phase = TitlePhase::Done;
+            g_title_joined = false;
+            Log("in-world join: the join settled in the world (%.1f s)", t.done_load);
+            return;
+        }
         {
             std::lock_guard<std::mutex> lk(t.mu);
             t.phase = TitlePhase::Done;
@@ -10882,6 +11019,7 @@ bool TitleJoinHold(const GameSnapshot& s) {
         }
         std::lock_guard<std::mutex> lk(t.mu);
         t.phase = TitlePhase::Requested;
+        t.in_world = false;
         t.since = now;
         Log("title join: asking the host for its room");
         return true;
@@ -11521,6 +11659,7 @@ void Tick(const GameSnapshot& s) {
     if (TitleJoinOn() || EnvOn("BB_PARTY_TITLE_JOIN_PROBE")) {
         TitleJoinHostTick(s);
         TitleJoinGuestTick(s, now);
+        InWorldJoinTick(s, now);
     }
     TestWarpTick(s, now);
     KickStalledTasks(s, now);

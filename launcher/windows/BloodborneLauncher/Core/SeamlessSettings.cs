@@ -5,6 +5,9 @@ namespace BloodborneLauncher.Core;
 
 public static partial class SeamlessSettings
 {
+    public const string TransportDirect = "direct";
+    public const string TransportSteam = "steam";
+
     /// <summary>The launcher's own co-op switches (settings.json; bb-start reads them, not the game).</summary>
     public static readonly (string Key, string Environment, string Label)[] Switches =
     {
@@ -57,9 +60,15 @@ public static partial class SeamlessSettings
         return moved;
     }
 
-    public static bool Enabled(LauncherSettings s) => s.Str("party_mode") is "host" or "join";
+    public static bool Enabled(LauncherSettings s) =>
+        s.Str("party_mode") is "host" or "join" ||
+        s.Str("party_transport") == TransportSteam;
     public static bool Flag(LauncherSettings s, string key, bool fallback = true) =>
         s.All.Any(item => item.Key == key) ? s.Bool(key) : fallback;
+    public static bool SteamMode(LauncherSettings s) =>
+        Enabled(s) && s.Str("party_transport") == TransportSteam;
+    public static uint SteamAppId(LauncherSettings s) =>
+        uint.TryParse(s.Str("steam_appid"), out var id) && id > 0 ? id : 480;
 
     public static string Name(LauncherSettings s)
     {
@@ -75,6 +84,15 @@ public static partial class SeamlessSettings
     public static string? Validate(LauncherSettings s)
     {
         if (!Enabled(s)) return null;
+        if (SteamMode(s))
+        {
+            if (s.PartyPassword.Length == 0)
+                return "Steam P2P needs a party password. Use the same password on every PC.";
+            var appText = s.Str("steam_appid");
+            if (appText.Length > 0 && (!uint.TryParse(appText, out var appid) || appid == 0))
+                return "Steam AppID must be a positive number.";
+            return null;
+        }
         if (!Regex.IsMatch(Name(s), "^[A-Za-z0-9_-]{1,16}$"))
             return "Party name must contain 1–16 letters, numbers, underscores or hyphens.";
         if (s.Str("party_port").Length > 0 &&
@@ -88,21 +106,32 @@ public static partial class SeamlessSettings
         return null;
     }
 
-    public static void Apply(LauncherSettings s, Dictionary<string, string> env)
+    public static void Apply(LauncherSettings s, Dictionary<string, string> env,
+        SteamAccount.Snapshot? steamAccount = null)
     {
-        env["BB_PARTY"] = Enabled(s) ? s.Str("party_mode") : "off";
+        var steam = SteamMode(s);
+        env["BB_PARTY"] = steam ? "host" : (Enabled(s) ? s.Str("party_mode") : "off");
         env["BB_PARTY_AUTOCONTINUE"] = "0";
         env["BB_PARTY_RESTARTED"] = "0";
         if (!Enabled(s)) return;
         env["BB_ONLINE"] = "0";
-        env["BB_PARTY_NAME"] = Name(s);
-        env["BB_PARTY_PORT"] = s.Str("party_port") is { Length: > 0 } port ? port : "9307";
-        env["BB_PARTY_CODE"] = s.Str("party_code").Trim();
+        env["BB_PARTY_NAME"] = steam ? SteamAccount.PartyName(steamAccount?.LocalName ?? "") : Name(s);
+        env["BB_PARTY_PORT"] = steam ? "9307" : (s.Str("party_port") is { Length: > 0 } port ? port : "9307");
+        env["BB_PARTY_CODE"] = steam ? "" : s.Str("party_code").Trim();
         env["BB_PARTY_PASSWORD"] = s.PartyPassword;
         env["BB_PARTY_MAX"] = s.Str("party_max") is "2" or "3" or "4" or "5" ? s.Str("party_max") : "3";
-        env["BB_PARTY_UPNP"] = Flag(s, "party_upnp") ? "1" : "0";
-        env["BB_PARTY_STUN"] = s.Str("party_stun");
-        env["BB_PARTY_PUBLIC_ADDR"] = s.Str("party_mode") == "host" ? s.Str("party_public_addr") : "";
+        env["BB_PARTY_STEAM"] = steam ? "1" : "0";
+        env["BB_PARTY_TRANSPORT"] = steam ? TransportSteam : TransportDirect;
+        if (steam)
+        {
+            env["BB_STEAM_APPID"] = SteamAppId(s).ToString();
+        }
+        else
+        {
+            env["BB_PARTY_UPNP"] = Flag(s, "party_upnp") ? "1" : "0";
+            env["BB_PARTY_STUN"] = s.Str("party_stun");
+            env["BB_PARTY_PUBLIC_ADDR"] = s.Str("party_mode") == "host" ? s.Str("party_public_addr") : "";
+        }
         env["BB_PARTY_SAVE"] = "separate";
         env["BB_PARTY_START"] = s.Str("party_start") == "immediate" ? "immediate" : "prologue_solo";
         env["BB_SAVE_BACKUP_MINUTES"] = s.Str("party_backup_minutes") is { Length: > 0 } minutes ? minutes : "10";
@@ -117,6 +146,7 @@ public static partial class SeamlessSettings
 
     public static string Codes(LauncherSettings s)
     {
+        if (SteamMode(s)) return "Steam P2P uses the Steam overlay friends list. There are no party codes to share.";
         var path = Path.Combine(GameEnvironment.UserDir(s), "party_code.txt");
         try { return File.Exists(path) ? File.ReadAllText(path).Trim() : "Start hosting to generate your party codes."; }
         catch (IOException) { return "Party codes are being updated."; }

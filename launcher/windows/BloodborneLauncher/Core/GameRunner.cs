@@ -54,7 +54,7 @@ namespace BloodborneLauncher.Core
         }
 
         /// <summary>Starts the game; returns null, or why it could not start.</summary>
-        public string? Start(LauncherSettings s)
+        public string? Start(LauncherSettings s, SteamAccount.Snapshot? steam = null)
         {
             if (_process != null)
                 return L.T("The game is already running.");
@@ -97,7 +97,7 @@ namespace BloodborneLauncher.Core
             }
 
             info.WorkingDirectory = Paths.IsPortDir(Paths.PortDir) ? Paths.EngineDir : Environment.CurrentDirectory;
-            foreach (var (key, value) in GameEnvironment.Build(s))
+            foreach (var (key, value) in GameEnvironment.Build(s, steam))
                 info.Environment[key] = value;
             info.Environment["PYTHONUNBUFFERED"] = "1";
             // UTF-8 whatever the Windows language: the game title (param.sfo) has a ™ that GBK and other

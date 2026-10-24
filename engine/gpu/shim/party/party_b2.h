@@ -98,6 +98,10 @@ bool TitleJoinRequested();
 bool TitleJoinHold(const GameSnapshot& s);
 /// Host: a guest at its title waits for this host's room (the director rings for it).
 bool TitleJoinPending();
+/// Guest, after a Steam P2P host -> guest switch in place (main thread): ask the new host for
+/// its room over the title-join protocol and join it from the current world (no title screen,
+/// no restart). Retried by the runtime; false without B2 / the title join.
+bool RequestInWorldJoin();
 /// Guest (A5, BB_PARTY_GATHER_DSUM experiment): the direct summon is on and its last attempt did
 /// not fail (dsummon::GatherFirst).
 bool DirectSummonCarries();

@@ -16,6 +16,14 @@ add_compile_options(-fno-omit-frame-pointer)
 # profile). Covers bbgpu and the static libraries linked into it. No -march: the same build
 # runs on the Steam Deck.
 option(BB_LTO "Link-time optimization of bbgpu" ON)
+# bbport: Steam P2P party transport. The SDK is vendored; the DLL is loaded at runtime, so a
+# package without steam_api64.dll keeps working in Direct/VPN mode.
+option(BB_STEAM "Steam P2P party transport (vendored Steamworks SDK)" ON)
+set(BB_STEAMWORKS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/steamworks" CACHE PATH "Steamworks SDK root")
+if (BB_STEAM AND NOT EXISTS "${BB_STEAMWORKS_DIR}/public/steam/steam_api.h")
+    message(WARNING "BB_STEAM is on but the Steamworks SDK is missing at ${BB_STEAMWORKS_DIR}; Steam mode is disabled")
+    set(BB_STEAM OFF)
+endif()
 # bbport: optional instruction set level (BB_MARCH=x86-64-v2 in build.sh; empty: the compiler's
 # default, x86-64). v2 (SSE4.2, POPCNT, SSSE3, CX16) is a subset of what the game's own code
 # already requires (probe.c check_cpu: AVX, BMI1, LZCNT, POPCNT, SSE4.2, MOVBE), so it shuts out
@@ -234,7 +242,7 @@ add_library(bbgpu ${BBGPU_LIBRARY_TYPE} ${VIDEO_CORE} ${RECOMPILER} ${COMMON} ${
 target_sources(bbgpu PRIVATE third_party/monocypher/monocypher.c)
 file(GLOB_RECURSE BB_ID_SOURCES CONFIGURE_DEPENDS shim/*.cpp shim/*.h ../src/*.c ../src/*.h)
 # The co-op mod's version: in the party build id (host and guests must match) and in the log.
-# Read from the repo's VERSION file (0.2.3-beta.1 -> 0.2.3); a change there reconfigures the build.
+# Read from the repo's VERSION file (0.3.0-beta.1 -> 0.3.0); a change there reconfigures the build.
 file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/../../VERSION" BB_VERSION_FULL LIMIT_COUNT 1)
 string(REGEX REPLACE "-.*$" "" BB_COOP_VERSION "${BB_VERSION_FULL}")
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/../../VERSION")
@@ -271,6 +279,10 @@ set_source_files_properties(shim/engine/keycap_art.cpp PROPERTIES
 target_include_directories(bbgpu PRIVATE shim shadps4 ${SHADER_INCLUDE} third_party/gcn/include third_party/half/include)
 # bbport: NVIDIA Streamline SDK headers (MIT), for DLSS Frame Generation (vk_streamline.cpp).
 target_include_directories(bbgpu PRIVATE third_party/streamline/include)
+if (BB_STEAM)
+    target_include_directories(bbgpu PRIVATE "${BB_STEAMWORKS_DIR}/public")
+    target_compile_definitions(bbgpu PRIVATE BB_STEAM=1)
+endif()
 target_compile_definitions(bbgpu PRIVATE BOOST_ASIO_STANDALONE NDEBUG)
 target_compile_options(bbgpu PRIVATE -Wno-deprecated-declarations -Wno-missing-field-initializers)
 # The Linux shared library is loaded at process startup; Windows links it statically.

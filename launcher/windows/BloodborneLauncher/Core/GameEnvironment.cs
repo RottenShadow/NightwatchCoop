@@ -110,7 +110,7 @@ namespace BloodborneLauncher.Core
         /// "keep"), or null when none is on.</summary>
         public static string? ResolutionPatchChoice { get; set; }
 
-        public static Dictionary<string, string> Build(LauncherSettings s)
+        public static Dictionary<string, string> Build(LauncherSettings s, SteamAccount.Snapshot? steam = null)
         {
             var fps = Fps(s);
             var env = new Dictionary<string, string>(StringComparer.Ordinal)
@@ -251,7 +251,7 @@ namespace BloodborneLauncher.Core
                 env["BB_CAPTURE_DIR"] = artifacts;
                 env["BB_DUMP_DIR"] = artifacts;
             }
-            SeamlessSettings.Apply(s, env);
+            SeamlessSettings.Apply(s, env, steam);
             return env;
         }
 

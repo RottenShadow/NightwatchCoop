@@ -18,6 +18,7 @@
 #pragma once
 
 #include "party_link.h"
+#include "game_state.h"
 
 #include <cstdint>
 #include <string>
@@ -95,5 +96,11 @@ void set_local_state(MemberState state, std::uint32_t map_id);
 /// Host, the director twice a second: the game's cooperator count (-1 unknown). F5: a drop while
 /// members' links are silent (an outage) ends those members' room memberships at once.
 void runtime_host_cooperators(int cooperators);
+/// Main thread, every director tick (Steam P2P only). A host that receives Join Game in the
+/// Steam overlay becomes a guest in place: the request waits until the player is in the world
+/// (world up, no loading screen, a player record), the game's own session is ended if needed,
+/// then the Steam/P2P link switches role and the world stays loaded. Afterwards (guest) it asks
+/// the new host for its room over B2 so the game joins it from here.
+void runtime_steam_join_tick(const coop::GameSnapshot& s);
 
 }  // namespace party

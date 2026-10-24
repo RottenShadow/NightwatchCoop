@@ -12,6 +12,10 @@ namespace bbnet::np {
 std::string npid_text(const void* npid);
 bool matching2_context_started();
 std::string matching2_status();
+// A Steam host -> guest switch replaces the party transport at runtime: the game's Np event
+// handler (subscribed on the old transport at context start) is subscribed on the current one.
+// No-op when the game has no context started.
+void matching2_events_restart();
 // Guest: the party host is gone (its game crashed or quit without a word: the party link is
 // down, or a restarted host does not know our room). A room we are in as a guest ends for the
 // game the way a host leaving ends it: DEAD per member, then ROOM_DESTROYED (0x1104, cause

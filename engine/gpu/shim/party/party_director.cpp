@@ -3683,6 +3683,26 @@ void PartyDirector::Configure(PartyRole role, int max_players) {
     st.max_players = max_players < 2 ? 2 : max_players > party::kMaxPartyPlayers ? party::kMaxPartyPlayers : max_players;
 }
 
+void PartyDirector::SwitchRole(PartyRole role) {
+    State& st = S();
+    int max_players;
+    {
+        std::lock_guard<std::mutex> lk(st.mu);
+        max_players = st.max_players;
+    }
+    Configure(role, max_players);
+    progress::SetRole(role == PartyRole::Host    ? progress::Role::Host  // C2 progress sync
+                      : role == PartyRole::Guest ? progress::Role::Guest
+                                                 : progress::Role::None);
+    {
+        std::lock_guard<std::mutex> lk(st.mu);
+        st.watchdog = HostWatchdog{};  // host-only clocks: a guest does not look at them
+        st.watchdog_check = false;
+    }
+    Log("director: role is %s now (max %d)",
+        role == PartyRole::Host ? "host" : role == PartyRole::Guest ? "guest" : "none", max_players);
+}
+
 void PartyDirector::ConfigureFromEnv() {
     State& st = S();
     PartyRole role = PartyRole::None;
@@ -4333,6 +4353,7 @@ void PartyDirector::Tick() {
     zone.Next(perf::Zone::DirNpcTest);
     NpcTestTick(s); // BB_PARTY_TEST_NPC fixture (party_npc_test.h)
     b2::Tick(s);    // B2 seamless prototype (party_b2.h; BB_PARTY_B2=1)
+    party::runtime_steam_join_tick(s);  // Steam overlay Join Game: host -> guest in place
     zone.End();
 
     PartyRole role;

@@ -79,7 +79,7 @@ bool ApplyRelaunch(const fs::path& file) {
             throw Error("Invalid party relaunch settings; no commands were executed");
         const std::string key = match[1], value = match[2];
         if (!StartsWith(key, "BB_PARTY") && !StartsWith(key, "BB_SKIP_NETWORK") && !StartsWith(key, "BB_SAVE_") &&
-            !StartsWith(key, "BB_AUTO_CONTINUE"))
+            !StartsWith(key, "BB_AUTO_CONTINUE") && !StartsWith(key, "BB_STEAM_"))
             throw Error("Unexpected party relaunch setting: " + key);
         updates.emplace_back(key, value);
     }

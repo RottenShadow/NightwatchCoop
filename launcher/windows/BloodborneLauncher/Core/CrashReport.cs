@@ -68,6 +68,10 @@ namespace BloodborneLauncher.Core
         private static string Cause(List<string> tail, long code)
         {
             bool Has(string text) => tail.Any(l => l.Contains(text, StringComparison.OrdinalIgnoreCase));
+            if (Has("STOP: Steam not open"))
+                return L.T("Steam was not open, so the Steam P2P party could not start. Start the Steam client, sign in, then press Play again.");
+            if (Has("STOP: Steam P2P failed"))
+                return L.T("Steam P2P could not start. Check that the Steam client is running, signed in, and that both PCs use the same AppID, then press Play again.");
             // The game's memory pool could not be created at start: Windows counts all of it against
             // RAM plus page file (error 1450: not enough left).
             if (Has("creating the memory pool section") || Has("mapping the memory pool"))
